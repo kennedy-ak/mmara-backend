@@ -20,10 +20,10 @@ class LegalAgent(BaseAgent):
     - Prepares legal citations
     """
 
-    def __init__(self, retrieval_service: RetrievalService, groq_client=None):
+    def __init__(self, retrieval_service: RetrievalService, openai_client=None):
         super().__init__()
         self.retrieval_service = retrieval_service
-        self.groq_client = groq_client
+        self.openai_client = openai_client
 
     @property
     def name(self) -> str:
@@ -124,12 +124,12 @@ class LegalAgent(BaseAgent):
         use_rerank = urgency not in ["high", "critical"]
 
         # Retrieve
-        if use_rerank and self.groq_client:
+        if use_rerank and self.openai_client:
             results = await self.retrieval_service.retrieve_with_rerank(
                 query=query,
                 n_results=top_k,
                 filter_metadata=filter_metadata,
-                groq_client=self.groq_client,
+                openai_client=self.openai_client,
             )
         else:
             results = await self.retrieval_service.retrieve(

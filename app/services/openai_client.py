@@ -1,40 +1,41 @@
 """
-Groq API Client Service.
-Handles LLM interactions using Groq's fast inference.
+OpenAI API Client Service.
+Handles LLM interactions using OpenAI's API (replaces Groq).
 """
 
+import json
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
-from groq import AsyncGroq
-from groq.types.chat import ChatCompletion, ChatCompletionChunk
 from langsmith import traceable
+from openai import AsyncOpenAI
 
 from app.config import LEGAL_SYSTEM_PROMPT, settings
 
 
-class GroqClient:
+class OpenAIClient:
     """
-    Client for interacting with Groq API.
+    Client for interacting with OpenAI API.
+    Provides a drop-in replacement for GroqClient.
     """
 
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "llama-3.3-70b-versatile",
+        model: str = "gpt-4o-mini",
         temperature: float = 0.1,
         max_tokens: int = 2000,
     ):
-        self.api_key = api_key or settings.groq_api_key
+        self.api_key = api_key or settings.openai_api_key
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
 
         if not self.api_key:
-            raise ValueError("Groq API key is required")
+            raise ValueError("OpenAI API key is required")
 
-        self.client = AsyncGroq(api_key=self.api_key)
+        self.client = AsyncOpenAI(api_key=self.api_key)
 
-    @traceable(name="groq.chat")
+    @traceable(name="openai.chat")
     async def chat(
         self,
         messages: List[Dict[str, str]],
@@ -42,7 +43,7 @@ class GroqClient:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         response_format: Optional[Dict[str, str]] = None,
-    ) -> ChatCompletion:
+    ):
         """
         Send a chat completion request.
 
@@ -56,14 +57,16 @@ class GroqClient:
         Returns:
             ChatCompletion response
         """
-        response = await self.client.chat.completions.create(
+        kwargs = dict(
             model=model or self.model,
             messages=messages,
-            temperature=temperature or self.temperature,
+            temperature=temperature if temperature is not None else self.temperature,
             max_tokens=max_tokens or self.max_tokens,
-            response_format=response_format,
         )
+        if response_format:
+            kwargs["response_format"] = response_format
 
+        response = await self.client.chat.completions.create(**kwargs)
         return response
 
     async def stream_chat(
@@ -72,7 +75,7 @@ class GroqClient:
         model: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
-    ) -> AsyncGenerator[ChatCompletionChunk, None]:
+    ) -> AsyncGenerator:
         """
         Stream a chat completion response.
 
@@ -88,7 +91,7 @@ class GroqClient:
         stream = await self.client.chat.completions.create(
             model=model or self.model,
             messages=messages,
-            temperature=temperature or self.temperature,
+            temperature=temperature if temperature is not None else self.temperature,
             max_tokens=max_tokens or self.max_tokens,
             stream=True,
         )
@@ -96,7 +99,7 @@ class GroqClient:
         async for chunk in stream:
             yield chunk
 
-    @traceable(name="groq.generate_legal_response")
+    @traceable(name="openai.generate_legal_response")
     async def generate_legal_response(
         self,
         query: str,
@@ -114,23 +117,18 @@ class GroqClient:
         Returns:
             Generated legal response
         """
-        # Build context string
         context_str = self._format_context(context)
 
-        # Build messages
         messages = [
             {"role": "system", "content": LEGAL_SYSTEM_PROMPT},
             {"role": "user", "content": f"Context:\n{context_str}\n\nQuestion: {query}"},
         ]
 
-        # Add conversation history if available
         if conversation_history:
             messages = [{"role": "system", "content": LEGAL_SYSTEM_PROMPT}]
-            # Add last few messages for context
             for msg in conversation_history[-6:]:
                 if msg["role"] in ["user", "assistant"]:
                     messages.append({"role": msg["role"], "content": msg["content"]})
-            # Add current query with context
             messages.append(
                 {
                     "role": "user",
@@ -139,10 +137,9 @@ class GroqClient:
             )
 
         response = await self.chat(messages)
-
         return response.choices[0].message.content or ""
 
-    @traceable(name="groq.classify_query")
+    @traceable(name="openai.classify_query")
     async def classify_query(self, query: str) -> Dict[str, Any]:
         """
         Classify the user query.
@@ -161,7 +158,7 @@ class GroqClient:
 4. **Is Emergency**: true or false
 
 Return ONLY a valid JSON object like:
-{"intent": "question", "category": "criminal", "urgency": "medium", "is_emergency": false, "reasoning": "brief explanation"}
+{{"intent": "question", "category": "criminal", "urgency": "medium", "is_emergency": false, "reasoning": "brief explanation"}}
 
 Query: {query}"""
 
@@ -169,8 +166,6 @@ Query: {query}"""
             messages=[{"role": "user", "content": classification_prompt.format(query=query)}],
             response_format={"type": "json_object"},
         )
-
-        import json
 
         try:
             return json.loads(response.choices[0].message.content or "{}")
@@ -210,7 +205,6 @@ Results:
 Return ONLY a valid JSON array with the indices of the top {top_k} most relevant results in order, like:
 [0, 3, 1, 4, 2]"""
 
-        # Format results for the prompt
         results_str = ""
         for i, result in enumerate(results):
             text_preview = result.get("text", "")[:200]
@@ -230,16 +224,12 @@ Return ONLY a valid JSON array with the indices of the top {top_k} most relevant
             response_format={"type": "json_object"},
         )
 
-        import json
-
         try:
             ranking = json.loads(response.choices[0].message.content or "[]")
-            # Get ranking indices
             indices = ranking.get("ranking", list(range(len(results))))
             if not isinstance(indices, list):
                 indices = list(range(len(results)))
 
-            # Reorder results based on ranking
             reranked = []
             for idx in indices[:top_k]:
                 if 0 <= idx < len(results):
@@ -286,8 +276,6 @@ Return ONLY a valid JSON array like:
             ],
             response_format={"type": "json_object"},
         )
-
-        import json
 
         try:
             citations = json.loads(response_obj.choices[0].message.content or "[]")

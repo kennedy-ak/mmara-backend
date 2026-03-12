@@ -1,6 +1,6 @@
 """
 Legal Document Chunker with Section-Based Strategy.
-Adapted from existing Streamlit app for async processing.
+Uses LlamaParse for AI-powered PDF extraction.
 """
 
 import asyncio
@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import pypdf
+from app.config import settings
 
 
 @dataclass
@@ -22,6 +22,28 @@ class LegalChunk:
 
     def to_dict(self) -> Dict[str, Any]:
         return {"text": self.text, "metadata": self.metadata, "chunk_id": self.chunk_id}
+
+
+# Lazy-initialized LlamaParse client
+_llama_parser = None
+
+
+def _get_parser():
+    """Lazy-init LlamaParse client."""
+    global _llama_parser
+    if _llama_parser is None:
+        from llama_parse import LlamaParse
+
+        _llama_parser = LlamaParse(
+            api_key=settings.llamaparse_api_key,
+            result_type="markdown",
+            parsing_instruction=(
+                "This is a Ghanaian legal document (Act, Legislative Instrument, or Regulation). "
+                "Preserve all section numbers, article numbers, headings, and table formatting. "
+                "Maintain the hierarchical structure of Parts, Chapters, Sections, and sub-sections."
+            ),
+        )
+    return _llama_parser
 
 
 class LegalDocumentChunker:
@@ -39,56 +61,43 @@ class LegalDocumentChunker:
         self.chunk_overlap = chunk_overlap
         self.min_chunk_size = min_chunk_size
 
-        # Patterns for detecting legal sections
+        # Patterns for detecting legal sections (includes markdown heading variants)
         self.section_patterns = [
+            r"^#{1,3}\s*Section\s+\d+",
             r"^Section\s+\d+",
             r"^Sec\.\s*\d+",
             r"^\d+\.\s+",
+            r"^#{1,3}\s*Article\s+\d+",
             r"^Article\s+\d+",
+            r"^#{1,3}\s*Part\s+[IVXLCDM]+",
             r"^Part\s+[IVXLCDM]+",
+            r"^#{1,3}\s*CHAPTER\s+[IVXLCDM]+",
             r"^CHAPTER\s+[IVXLCDM]+",
             r"^Act\s+\d+",
             r"^L\.I\.\s*\d+",
             r"^\(\d+\)",
         ]
 
-    def extract_text_from_pdf(self, pdf_path: Path) -> tuple[str, Dict[str, Any]]:
+    async def extract_text_from_pdf(self, pdf_path: Path) -> tuple[str, Dict[str, Any]]:
         """
-        Extract text and basic metadata from PDF.
+        Extract text and basic metadata from PDF using LlamaParse.
 
         Returns:
             tuple: (full_text, base_metadata)
         """
         try:
-            reader = pypdf.PdfReader(str(pdf_path))
-            text_parts = []
+            parser = _get_parser()
+            documents = await parser.aload_data(str(pdf_path))
 
-            for page in reader.pages:
-                try:
-                    page_text = page.extract_text()
-                    if page_text:
-                        text_parts.append(page_text)
-                except Exception:
-                    continue
-
-            full_text = "\n".join(text_parts)
+            # Combine all document pages
+            full_text = "\n".join(doc.text for doc in documents)
 
             # Extract metadata
             metadata = {
                 "source_file": pdf_path.name,
-                "total_pages": len(reader.pages),
+                "total_pages": len(documents),
                 "file_size": pdf_path.stat().st_size,
             }
-
-            # Try to extract metadata from PDF info
-            if reader.metadata:
-                metadata.update(
-                    {
-                        "title": reader.metadata.get("/Title", ""),
-                        "author": reader.metadata.get("/Author", ""),
-                        "creator": reader.metadata.get("/Creator", ""),
-                    }
-                )
 
             return full_text, metadata
 
@@ -226,7 +235,7 @@ class LegalDocumentChunker:
 
         return chunks
 
-    def chunk_document(self, pdf_path: Path, force_section_based: bool = False) -> List[LegalChunk]:
+    async def chunk_document(self, pdf_path: Path, force_section_based: bool = False) -> List[LegalChunk]:
         """
         Chunk a legal document PDF.
 
@@ -237,8 +246,8 @@ class LegalDocumentChunker:
         Returns:
             List of LegalChunk objects
         """
-        # Extract text and base metadata
-        full_text, base_metadata = self.extract_text_from_pdf(pdf_path)
+        # Extract text and base metadata (async with LlamaParse)
+        full_text, base_metadata = await self.extract_text_from_pdf(pdf_path)
 
         # Extract legal-specific metadata
         legal_metadata = self.extract_legal_metadata(pdf_path.name, full_text)
@@ -318,7 +327,7 @@ class LegalDocumentChunker:
 
     async def chunk_document_async(self, pdf_path: Path) -> List[LegalChunk]:
         """
-        Async wrapper for chunking a document.
+        Async chunking — delegates to chunk_document which is already async.
 
         Args:
             pdf_path: Path to the PDF file
@@ -326,9 +335,7 @@ class LegalDocumentChunker:
         Returns:
             List of LegalChunk objects
         """
-        # Run in thread pool to avoid blocking
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self.chunk_document, pdf_path)
+        return await self.chunk_document(pdf_path)
 
     async def chunk_directory(
         self, directory: Path, pattern: str = "*.pdf", category: Optional[str] = None

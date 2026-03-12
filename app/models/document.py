@@ -85,4 +85,4 @@ class DocumentStats(BaseModel):
     total_chunks: int
     by_category: Dict[str, int]
     by_doc_type: Dict[str, int]
-    last_updated: datetime
+    last_updated: Optional[datetime] = None

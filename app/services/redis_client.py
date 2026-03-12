@@ -4,11 +4,14 @@ Handles caching, session storage, and rate limiting.
 """
 
 import json
+import logging
 from typing import Any, Dict, List, Optional
 
 import redis.asyncio as aioredis
 
 from app.config import settings
+
+logger = logging.getLogger("mmara")
 
 
 class RedisService:
@@ -24,14 +27,32 @@ class RedisService:
         self.decode_responses = decode_responses
         self._client: Optional[aioredis.Redis] = None
         self._pool: Optional[aioredis.ConnectionPool] = None
+        self.max_connections = getattr(settings, "redis_max_connections", 50)
 
     async def connect(self):
-        """Establish Redis connection."""
+        """Establish Redis connection with connection pooling."""
         if self._client is None:
+            # Create connection pool with health checking
             self._pool = aioredis.ConnectionPool.from_url(
-                self.url, encoding=self.encoding, decode_responses=self.decode_responses
+                self.url,
+                encoding=self.encoding,
+                decode_responses=self.decode_responses,
+                max_connections=self.max_connections,
+                socket_keepalive=True,
+                socket_connect_timeout=5,
+                socket_timeout=5,
+                retry_on_timeout=True,
+                health_check_interval=30,  # Check connection health every 30s
             )
             self._client = aioredis.Redis(connection_pool=self._pool)
+
+            # Test connection
+            try:
+                await self._client.ping()
+            except Exception as e:
+                logger.error(f"Redis connection failed: {e}")
+                await self.disconnect()
+                raise
 
     async def disconnect(self):
         """Close Redis connection."""

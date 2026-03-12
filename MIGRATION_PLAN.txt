@@ -1,0 +1,131 @@
+MIGRATION PLAN: pypdf -> LlamaParse + ChromaDB -> Pinecone
+============================================================
+
+CONTEXT
+-------
+MMara's current PDF extraction uses pypdf, which produces basic text that often
+mangles tables, headers, and legal formatting. Replacing it with LlamaParse
+(AI-powered extraction) will produce much cleaner, structure-aware text -- the
+single biggest accuracy improvement. Replacing ChromaDB with Pinecone moves the
+vector DB to a managed cloud service with better scalability. The local
+MiniLM-L6-v2 embedding model stays (free, no API cost). Existing section-based
+chunking logic stays.
+
+
+FILES TO MODIFY (in order)
+==========================
+
+1. app/config.py -- Settings
+   - Remove: chroma_persist_directory, chroma_collection_name,
+     chroma_persist_directory_resolved property
+   - Add: llamaparse_api_key, pinecone_api_key, pinecone_index_name,
+     pinecone_namespace, pinecone_environment
+
+2. .env.example -- Environment template
+   - Remove: CHROMA_PERSIST_DIR, CHROMA_COLLECTION_NAME
+   - Add: LLAMAPARSE_API_KEY, PINECONE_API_KEY, PINECONE_INDEX_NAME,
+     PINECONE_NAMESPACE
+
+3. pyproject.toml + requirements.txt -- Dependencies
+   - Remove: chromadb, pypdf, pdfplumber
+   - Add: llama-parse, pinecone[grpc]
+
+4. app/services/chunker.py -- PDF Extraction (LlamaParse)
+   - Replace "import pypdf" with "from llama_parse import LlamaParse"
+   - Add lazy-init LlamaParse client with result_type="markdown" and a
+     legal-document parsing instruction
+   - Make extract_text_from_pdf() async -- call parser.aload_data() instead of
+     pypdf.PdfReader
+   - Make chunk_document() async (since extraction is now async)
+   - Simplify chunk_document_async() to just delegate (no more run_in_executor)
+   - KEEP ALL CHUNKING LOGIC UNCHANGED (section-based, sentence-based,
+     metadata extraction)
+
+5. app/services/embeddings.py -- Vector DB (Pinecone) FULL REWRITE
+   - Replace chromadb.PersistentClient with pinecone.Pinecone client
+   - Auto-create index if it doesn't exist (dimension=384, metric=cosine,
+     serverless)
+   - add_chunks(): store chunk text inside Pinecone metadata (well within 40KB
+     limit at 512-char chunks), use index.upsert(), sanitize metadata types
+   - search(): return results in ChromaDB-compatible format
+     ({"ids": [[...]], "distances": [[...]], ...}) so RetrievalService needs
+     minimal changes. Convert Pinecone similarity score to distance via
+     1 - score
+   - get_collection_stats(): use index.describe_index_stats() filtered by
+     namespace
+   - delete_collection() / rebuild_collection(): use
+     index.delete(delete_all=True, namespace=...)
+   - get_documents_by_ids(): use index.fetch(ids=..., namespace=...)
+
+6. app/services/retrieval.py -- Hybrid Search Updates
+   - build_bm25_index(): replace ChromaDB collection.get(limit, offset)
+     pagination with Pinecone index.list() + index.fetch() in batches of 100
+   - retrieve() document fetch (line ~235): replace collection.get(ids=...)
+     with index.fetch(ids=..., namespace=...)
+   - Add invalidate_bm25_index() method to reset BM25 cache after new
+     documents are added
+
+7. app/dependencies.py -- Service Wiring
+   - Update get_embedding_service(): pass pinecone_api_key, index_name,
+     namespace, embedding_model instead of persist_directory
+
+8. app/api/v1/admin.py -- Admin Endpoints
+   - upload_document(): change upload dir from embedding_service.persist_directory
+     to settings.data_dir / "uploads"
+   - process_pending_documents(): add RetrievalSvc dependency, call
+     retrieval_service.invalidate_bm25_index() after processing
+   - delete_document(): implement Pinecone chunk deletion via
+     index.delete(filter={"source_file": ...})
+   - get_document_stats(): rename chroma_stats -> vector_stats (cosmetic)
+
+
+FILES THAT NEED NO CHANGES
+===========================
+- app/agents/orchestrator.py -- uses RetrievalService through LegalAgent
+- app/agents/legal.py -- calls retrieval_service.retrieve()
+- app/agents/intake.py, safety.py, base.py -- no vector/PDF interaction
+- app/services/groq_client.py, redis_client.py -- unrelated
+- app/api/v1/chat.py, auth.py, users.py -- use orchestrator abstraction
+- app/db/models.py, app/models/* -- unchanged
+
+
+KEY DESIGN DECISIONS
+====================
+1. Text stored in Pinecone metadata -- Pinecone has no "documents" field like
+   ChromaDB; chunk text goes in metadata["text"] (40KB limit, our chunks are
+   ~512 chars)
+2. ChromaDB-compatible search() return format -- keeps
+   RetrievalService._semantic_search() working without changes
+3. LlamaParse markdown output -- preserves headings/structure that the existing
+   section regex patterns can match
+4. Lazy BM25 build -- BM25 index rebuilds on first search after invalidation
+
+
+VERIFICATION PLAN
+=================
+1. Config: Set LLAMAPARSE_API_KEY, PINECONE_API_KEY, PINECONE_INDEX_NAME in .env
+2. Install deps: pip install llama-parse "pinecone[grpc]" (and remove old ones)
+3. Test extraction: Upload a test PDF via POST /api/v1/admin/documents, then
+   POST /api/v1/admin/process-pending -- verify chunks are created in Pinecone
+4. Test retrieval: Use POST /api/v1/admin/retrieve with a legal query -- verify
+   results come back with text and metadata
+5. Test chat: Send a message via POST /api/v1/chat/message -- verify the full
+   pipeline (intake -> safety -> legal retrieval -> LLM -> response) works
+   end-to-end
+6. Test stats: GET /api/v1/admin/stats -- verify document/chunk counts reflect
+   Pinecone data
+7. Test deletion: Delete a document via DELETE /api/v1/admin/documents/{id} --
+   verify chunks are removed from Pinecone
+
+
+POTENTIAL RISKS
+===============
+- LlamaParse rate limits: Free tier has limited pages/day; bulk re-indexing may
+  need batching
+- Markdown section patterns: LlamaParse markdown may prefix headers with # --
+  if section detection breaks, add "^#{1,3}\s*Section\s+\d+" patterns to
+  section_patterns list
+- BM25 cold start: First search after restart fetches ALL vectors from
+  Pinecone -- could be slow for large collections
+- Pinecone metadata types: Must be str/int/float/bool/list[str] --
+  sanitization logic handles this

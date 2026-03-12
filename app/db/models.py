@@ -77,7 +77,7 @@ class Document(Base):
     status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False)
     chunk_count: Mapped[int] = mapped_column(Integer, default=0)
     file_path: Mapped[Optional[str]] = mapped_column(String(500))
-    metadata: Mapped[Optional[dict]] = mapped_column(JSON)
+    doc_metadata: Mapped[Optional[dict]] = mapped_column(JSON)
     uploaded_by: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("users.id"))
     uploaded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -124,3 +124,23 @@ class RateLimit(Base):
     last_request: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+
+class PasswordReset(Base):
+    """Password reset token tracking."""
+
+    __tablename__ = "password_resets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    token: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    used: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    # Relationships
+    user: Mapped["User"] = relationship("User", backref="password_resets")

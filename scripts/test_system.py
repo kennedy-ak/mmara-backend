@@ -22,7 +22,11 @@ async def test_embeddings():
     """Test embedding service."""
     print("\n=== Testing Embedding Service ===")
 
-    service = EmbeddingService(persist_directory=settings.chroma_persist_directory_resolved)
+    service = EmbeddingService(
+        pinecone_api_key=settings.pinecone_api_key,
+        index_name=settings.pinecone_index_name,
+        namespace=settings.pinecone_namespace,
+    )
 
     stats = service.get_collection_stats()
     print(f"Collection: {stats['name']}")
@@ -45,7 +49,9 @@ async def test_retrieval():
     print("\n=== Testing Retrieval Service ===")
 
     embedding_service = EmbeddingService(
-        persist_directory=settings.chroma_persist_directory_resolved
+        pinecone_api_key=settings.pinecone_api_key,
+        index_name=settings.pinecone_index_name,
+        namespace=settings.pinecone_namespace,
     )
 
     retrieval_service = RetrievalService(embedding_service=embedding_service)
@@ -91,7 +97,9 @@ async def test_orchestrator():
 
     # Initialize services
     embedding_service = EmbeddingService(
-        persist_directory=settings.chroma_persist_directory_resolved
+        pinecone_api_key=settings.pinecone_api_key,
+        index_name=settings.pinecone_index_name,
+        namespace=settings.pinecone_namespace,
     )
     retrieval_service = RetrievalService(embedding_service=embedding_service)
 

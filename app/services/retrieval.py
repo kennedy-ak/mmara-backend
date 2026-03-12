@@ -7,6 +7,7 @@ import asyncio
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+from langsmith import traceable
 from rank_bm25 import BM25Okapi
 
 from app.services.embeddings import EmbeddingService
@@ -38,29 +39,50 @@ class RetrievalService:
         self._bm25_built = False
 
     async def build_bm25_index(self):
-        """Build BM25 index from existing vector database."""
+        """Build BM25 index from Pinecone vectors."""
         if self._bm25_built:
             return
 
-        print("Building BM25 index...")
+        print("Building BM25 index from Pinecone...")
 
-        # Get all documents from ChromaDB
-        collection = self.embedding_service.collection
-        count = collection.count()
+        index = self.embedding_service.index
+        namespace = self.embedding_service.namespace
 
-        # Fetch in batches
-        batch_size = 1000
         all_docs = []
         all_ids = []
         all_metadata = []
 
-        for offset in range(0, count, batch_size):
-            batch = collection.get(
-                limit=batch_size, offset=offset, include=["documents", "metadatas"]
-            )
-            all_docs.extend(batch["documents"])
-            all_ids.extend(batch["ids"])
-            all_metadata.extend(batch["metadatas"])
+        # Use index.list() to paginate through all vector IDs, then fetch in batches
+        batch_size = 100
+        id_batch = []
+
+        for id_list in index.list(namespace=namespace):
+            for vec_id in id_list:
+                id_batch.append(vec_id)
+                if len(id_batch) >= batch_size:
+                    fetched = index.fetch(ids=id_batch, namespace=namespace)
+                    for vid, vdata in fetched.get("vectors", {}).items():
+                        meta = dict(vdata.get("metadata", {}))
+                        text = meta.pop("text", "")
+                        all_ids.append(vid)
+                        all_docs.append(text)
+                        all_metadata.append(meta)
+                    id_batch = []
+
+        # Fetch remaining
+        if id_batch:
+            fetched = index.fetch(ids=id_batch, namespace=namespace)
+            for vid, vdata in fetched.get("vectors", {}).items():
+                meta = dict(vdata.get("metadata", {}))
+                text = meta.pop("text", "")
+                all_ids.append(vid)
+                all_docs.append(text)
+                all_metadata.append(meta)
+
+        if not all_docs:
+            self._bm25_built = True
+            print("BM25 index: no documents found")
+            return
 
         # Tokenize documents for BM25
         loop = asyncio.get_event_loop()
@@ -74,7 +96,15 @@ class RetrievalService:
         self.bm25 = BM25Okapi(tokenized_docs)
         self._bm25_built = True
 
-        print(f"✓ BM25 index built with {len(all_docs)} documents")
+        print(f"BM25 index built with {len(all_docs)} documents")
+
+    def invalidate_bm25_index(self):
+        """Reset BM25 cache so it rebuilds on next search."""
+        self._bm25_built = False
+        self.bm25 = None
+        self.documents = []
+        self.doc_ids = []
+        self.metadatas = []
 
     def _tokenize(self, text: str) -> List[str]:
         """Simple tokenizer for BM25."""
@@ -117,6 +147,9 @@ class RetrievalService:
         """
         if not self._bm25_built:
             await self.build_bm25_index()
+
+        if not self.bm25:
+            return []
 
         # Tokenize query
         loop = asyncio.get_event_loop()
@@ -189,6 +222,7 @@ class RetrievalService:
 
         return formatted
 
+    @traceable(name="retrieval.retrieve")
     async def retrieve(
         self,
         query: str,
@@ -230,23 +264,27 @@ class RetrievalService:
                 query, n_results=n_results, filter_metadata=filter_metadata
             )
 
-        # Fetch full documents
+        # Fetch full documents from Pinecone
         doc_ids = [r[0] for r in fused_results]
-        fetched = self.embedding_service.collection.get(
-            ids=doc_ids, include=["documents", "metadatas"]
+        if not doc_ids:
+            return []
+
+        fetched_raw = self.embedding_service.index.fetch(
+            ids=doc_ids, namespace=self.embedding_service.namespace
         )
+        vectors = fetched_raw.get("vectors", {})
 
         # Build final results
         final_results = []
-        id_to_index = {id_: i for i, id_ in enumerate(fetched["ids"])}
-
         for doc_id, rrf_score, _ in fused_results:
-            idx = id_to_index.get(doc_id)
-            if idx is not None:
+            vdata = vectors.get(doc_id)
+            if vdata:
+                meta = dict(vdata.get("metadata", {}))
+                text = meta.pop("text", "")
                 final_results.append(
                     {
-                        "text": fetched["documents"][idx],
-                        "metadata": fetched["metadatas"][idx],
+                        "text": text,
+                        "metadata": meta,
                         "rrf_score": rrf_score,
                         "chunk_id": doc_id,
                     }
@@ -263,15 +301,15 @@ class RetrievalService:
         )
 
     async def rerank(
-        self, query: str, results: List[Dict[str, Any]], groq_client, top_k: int = 5
+        self, query: str, results: List[Dict[str, Any]], openai_client, top_k: int = 5
     ) -> List[Dict[str, Any]]:
         """
-        Rerank results using Groq LLM.
+        Rerank results using OpenAI LLM.
 
         Args:
             query: Original query
             results: Retrieved results
-            groq_client: Groq client for reranking
+            openai_client: OpenAI client for reranking
             top_k: Number of results to return
 
         Returns:
@@ -280,8 +318,7 @@ class RetrievalService:
         if not results:
             return []
 
-        # Use Groq to rerank
-        reranked = await groq_client.rerank_results(query, results, top_k)
+        reranked = await openai_client.rerank_results(query, results, top_k)
 
         return reranked
 
@@ -290,7 +327,7 @@ class RetrievalService:
         query: str,
         n_results: int = 5,
         filter_metadata: Optional[Dict] = None,
-        groq_client=None,
+        openai_client=None,
         fetch_k: int = 15,
     ) -> List[Dict[str, Any]]:
         """
@@ -300,20 +337,18 @@ class RetrievalService:
             query: User query
             n_results: Final number of results to return
             filter_metadata: Optional metadata filter
-            groq_client: Groq client for reranking
+            openai_client: OpenAI client for reranking
             fetch_k: Number of results to fetch before reranking
 
         Returns:
             Final reranked results
         """
-        # Fetch more results
         results = await self.retrieve(
             query=query, n_results=fetch_k, filter_metadata=filter_metadata
         )
 
-        # Rerank if Groq client available
-        if groq_client:
-            results = await self.rerank(query, results, groq_client, n_results)
+        if openai_client:
+            results = await self.rerank(query, results, openai_client, n_results)
         else:
             results = results[:n_results]
 

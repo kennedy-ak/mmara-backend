@@ -1,0 +1,77 @@
+# MMara Backend API Endpoints
+
+All endpoints are prefixed with /api/v1
+
+================================================================================
+ROOT ENDPOINTS
+================================================================================
+
+GET  /           - Root endpoint with API information
+GET  /health     - Health check endpoint
+GET  /metrics    - Application metrics
+GET  /info       - Application information
+
+================================================================================
+AUTHENTICATION (/api/v1/auth)
+================================================================================
+
+POST /auth/register                - Register a new user
+POST /auth/login                   - Login with OAuth2 form (username/password)
+POST /auth/login/json              - Login with JSON credentials
+POST /auth/refresh                  - Refresh access token
+GET  /auth/me                      - Get current user info
+POST /auth/logout                   - Logout user
+POST /auth/password-reset/request   - Request password reset
+POST /auth/password-reset/confirm   - Confirm password reset
+POST /auth/change-password           - Change password
+
+================================================================================
+CHAT (/api/v1/chat)
+================================================================================
+
+POST   /chat/message                - Send a chat message
+GET    /chat/history                - Get all chat sessions
+GET    /chat/history/{session_id}   - Get specific session history
+DELETE /chat/history/{session_id}   - Delete a session
+DELETE /chat/history                 - Delete all sessions
+POST   /chat/feedback               - Submit feedback on responses
+
+================================================================================
+USERS (/api/v1/users)
+================================================================================
+
+GET  /users/me        - Get current user profile
+PUT  /users/me        - Update current user profile
+GET  /users/me/stats  - Get current user statistics
+GET  /users/          - List all users (admin)
+GET  /users/{user_id} - Get specific user
+DELETE /users/{user_id} - Delete a user
+
+================================================================================
+ADMIN (/api/v1/admin)
+================================================================================
+
+POST   /admin/documents              - Upload a new document
+GET    /admin/documents              - List all documents
+DELETE /admin/documents/{document_id} - Delete a document
+POST   /admin/reindex                - Reindex all documents
+POST   /admin/retrieve               - Test retrieval system
+GET    /admin/stats                  - Get document statistics
+POST   /admin/process-pending        - Process pending documents
+
+================================================================================
+RATE LIMITS
+================================================================================
+
+Free tier:       50 requests/day
+Authenticated:  500 requests/day
+Premium:         Unlimited
+
+================================================================================
+AUTHENTICATION
+================================================================================
+
+Most endpoints require JWT authentication. Use /api/v1/auth/login to obtain 
+a token, then include it in the Authorization header:
+
+    Authorization: Bearer <token>

@@ -3,11 +3,17 @@ Base Agent Class.
 Defines the interface and common functionality for all agents.
 """
 
+import logging
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, Optional
+
+from langsmith import traceable
+
+logger = logging.getLogger("mmara.agents")
 
 
 class AgentStatus(str, Enum):
@@ -98,9 +104,10 @@ class BaseAgent(ABC):
         """
         pass
 
+    @traceable(name="agent.execute")
     async def execute(self, context: AgentContext) -> AgentResult:
         """
-        Execute the agent with timing and error handling.
+        Execute the agent with timing, logging, and tracing.
 
         Args:
             context: Agent context
@@ -108,21 +115,45 @@ class BaseAgent(ABC):
         Returns:
             AgentResult
         """
-        start_time = datetime.now(timezone.utc)
+        start_time = time.time()
+        logger.info(
+            "[%s] Starting execution | query='%s'",
+            self.name,
+            context.query[:80],
+        )
 
         try:
             result = await self.process(context)
             self._execution_count += 1
+
+            execution_time = time.time() - start_time
+            self._execution_times.append(execution_time)
+
+            logger.info(
+                "[%s] Completed in %.3fs | status=%s confidence=%.2f | metadata_keys=%s",
+                self.name,
+                execution_time,
+                result.status.value,
+                result.confidence,
+                list(result.data.keys()),
+            )
+
             return result
         except Exception as e:
-            # Log error and return failure result
+            execution_time = time.time() - start_time
+            self._execution_times.append(execution_time)
+
+            logger.error(
+                "[%s] FAILED in %.3fs | error=%s",
+                self.name,
+                execution_time,
+                str(e),
+                exc_info=True,
+            )
+
             return AgentResult(
                 status=AgentStatus.FAILED, data={}, message=f"Agent {self.name} failed: {str(e)}"
             )
-        finally:
-            # Track execution time
-            execution_time = (datetime.now(timezone.utc) - start_time).total_seconds()
-            self._execution_times.append(execution_time)
 
     def get_stats(self) -> Dict[str, Any]:
         """Get agent execution statistics."""

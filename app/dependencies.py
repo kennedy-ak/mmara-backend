@@ -15,7 +15,7 @@ from app.core.security import decode_token
 from app.db.session import async_session_maker
 from app.models.user import UserInDB
 from app.services.embeddings import EmbeddingService
-from app.services.groq_client import GroqClient
+from app.services.openai_client import OpenAIClient
 from app.services.redis_client import RedisService
 from app.services.retrieval import RetrievalService
 
@@ -143,7 +143,7 @@ async def require_admin(
 # Service singletons (could be improved with proper DI container)
 _embedding_service: EmbeddingService | None = None
 _retrieval_service: RetrievalService | None = None
-_groq_client: GroqClient | None = None
+_openai_client: OpenAIClient | None = None
 _redis_service: RedisService | None = None
 _orchestrator: AgentOrchestrator | None = None
 
@@ -153,7 +153,9 @@ async def get_embedding_service() -> EmbeddingService:
     global _embedding_service
     if _embedding_service is None:
         _embedding_service = EmbeddingService(
-            persist_directory=settings.chroma_persist_directory_resolved,
+            pinecone_api_key=settings.pinecone_api_key,
+            index_name=settings.pinecone_index_name,
+            namespace=settings.pinecone_namespace,
             embedding_model=settings.embedding_model,
         )
     return _embedding_service
@@ -169,12 +171,15 @@ async def get_retrieval_service(
     return _retrieval_service
 
 
-async def get_groq_client() -> GroqClient:
-    """Get or create Groq client singleton."""
-    global _groq_client
-    if _groq_client is None:
-        _groq_client = GroqClient(api_key=settings.groq_api_key, model=settings.groq_model)
-    return _groq_client
+async def get_openai_client() -> OpenAIClient:
+    """Get or create OpenAI client singleton."""
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = OpenAIClient(
+            api_key=settings.openai_api_key,
+            model=settings.openai_model,
+        )
+    return _openai_client
 
 
 async def get_redis_service() -> RedisService:
@@ -182,12 +187,13 @@ async def get_redis_service() -> RedisService:
     global _redis_service
     if _redis_service is None:
         _redis_service = RedisService(url=settings.redis_url)
+        await _redis_service.connect()
     return _redis_service
 
 
 async def get_orchestrator(
     retrieval_service: Annotated[RetrievalService, Depends(get_retrieval_service)],
-    groq_client: Annotated[GroqClient, Depends(get_groq_client)],
+    openai_client: Annotated[OpenAIClient, Depends(get_openai_client)],
     redis_service: Annotated[RedisService, Depends(get_redis_service)],
 ) -> AgentOrchestrator:
     """Get or create agent orchestrator singleton."""
@@ -195,7 +201,7 @@ async def get_orchestrator(
     if _orchestrator is None:
         _orchestrator = AgentOrchestrator(
             retrieval_service=retrieval_service,
-            groq_client=groq_client,
+            openai_client=openai_client,
             redis_service=redis_service,
         )
     return _orchestrator
@@ -207,6 +213,27 @@ CurrentUser = Annotated[UserInDB, Depends(get_current_active_user)]
 AdminUser = Annotated[UserInDB, Depends(require_admin)]
 EmbeddingSvc = Annotated[EmbeddingService, Depends(get_embedding_service)]
 RetrievalSvc = Annotated[RetrievalService, Depends(get_retrieval_service)]
-GroqSvc = Annotated[GroqClient, Depends(get_groq_client)]
+OpenAISvc = Annotated[OpenAIClient, Depends(get_openai_client)]
 RedisSvc = Annotated[RedisService, Depends(get_redis_service)]
 OrchestratorSvc = Annotated[AgentOrchestrator, Depends(get_orchestrator)]
+
+# Re-export for rate limiting
+__all__ = [
+    "DBSession",
+    "CurrentUser",
+    "AdminUser",
+    "EmbeddingSvc",
+    "RetrievalSvc",
+    "OpenAISvc",
+    "RedisSvc",
+    "OrchestratorSvc",
+    "get_db",
+    "get_current_user",
+    "get_current_active_user",
+    "require_admin",
+    "get_embedding_service",
+    "get_retrieval_service",
+    "get_openai_client",
+    "get_redis_service",
+    "get_orchestrator",
+]

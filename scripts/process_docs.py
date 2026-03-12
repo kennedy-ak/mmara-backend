@@ -27,7 +27,9 @@ async def process_documents(directory: str, category: str = None, force_rebuild:
 
     # Initialize services
     embedding_service = EmbeddingService(
-        persist_directory=settings.chroma_persist_directory_resolved,
+        pinecone_api_key=settings.pinecone_api_key,
+        index_name=settings.pinecone_index_name,
+        namespace=settings.pinecone_namespace,
         embedding_model=settings.embedding_model,
     )
 

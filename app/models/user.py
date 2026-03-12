@@ -91,3 +91,54 @@ class UserStats(BaseModel):
     queries_this_month: int
     avg_response_time: float
     satisfaction_score: Optional[float] = None
+
+
+class PasswordResetRequest(BaseModel):
+    """Model for password reset request."""
+
+    email: EmailStr = Field(..., description="Email address for password reset")
+
+
+class PasswordResetConfirm(BaseModel):
+    """Model for password reset confirmation."""
+
+    token: str = Field(..., min_length=1, description="Password reset token")
+    new_password: str = Field(..., min_length=8, max_length=128, description="New password")
+
+    @field_validator("new_password")
+    @classmethod
+    def validate_new_password(cls, v: str) -> str:
+        """Validate new password strength."""
+        if not any(c.isupper() for c in v):
+            raise ValueError("Password must contain at least one uppercase letter")
+        if not any(c.islower() for c in v):
+            raise ValueError("Password must contain at least one lowercase letter")
+        if not any(c.isdigit() for c in v):
+            raise ValueError("Password must contain at least one digit")
+        return v
+
+
+class PasswordResetResponse(BaseModel):
+    """Model for password reset response."""
+
+    message: str
+    success: bool = True
+
+
+class ChangePasswordRequest(BaseModel):
+    """Model for changing password when logged in."""
+
+    old_password: str = Field(..., min_length=1, description="Current password")
+    new_password: str = Field(..., min_length=8, max_length=128, description="New password")
+
+    @field_validator("new_password")
+    @classmethod
+    def validate_new_password(cls, v: str) -> str:
+        """Validate new password strength."""
+        if not any(c.isupper() for c in v):
+            raise ValueError("Password must contain at least one uppercase letter")
+        if not any(c.islower() for c in v):
+            raise ValueError("Password must contain at least one lowercase letter")
+        if not any(c.isdigit() for c in v):
+            raise ValueError("Password must contain at least one digit")
+        return v

@@ -20,9 +20,9 @@ class IntakeAgent(BaseAgent):
     - Language (English, future: Twi)
     """
 
-    def __init__(self, groq_client=None):
+    def __init__(self, openai_client=None):
         super().__init__()
-        self.groq_client = groq_client
+        self.openai_client = openai_client
 
     @property
     def name(self) -> str:
@@ -48,8 +48,8 @@ class IntakeAgent(BaseAgent):
         classification = self._quick_classify(query)
 
         # Override with LLM if available and needed
-        if self.groq_client and classification.get("urgency") in ["high", "critical"]:
-            llm_classification = await self.groq_client.classify_query(context.query)
+        if self.openai_client and classification.get("urgency") in ["high", "critical"]:
+            llm_classification = await self.openai_client.classify_query(context.query)
             # Merge classifications (prefer LLM for complex cases)
             classification.update(llm_classification)
 

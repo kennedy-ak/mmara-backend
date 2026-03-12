@@ -4,17 +4,22 @@ Coordinates the multi-agent workflow for processing legal queries.
 """
 
 import json
+import logging
 import time
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from langsmith import traceable
+
 from app.agents.base import AgentContext
+
+logger = logging.getLogger("mmara.orchestrator")
 from app.agents.intake import IntakeAgent
 from app.agents.legal import LegalAgent
 from app.agents.safety import EmergencyHandler, ResponseValidator, SafetyAgent
 from app.config import LEGAL_SYSTEM_PROMPT
-from app.services.groq_client import GroqClient
+from app.services.openai_client import OpenAIClient
 from app.services.redis_client import RedisService
 from app.services.retrieval import RetrievalService
 
@@ -35,43 +40,39 @@ class AgentOrchestrator:
     def __init__(
         self,
         retrieval_service: RetrievalService,
-        groq_client: GroqClient,
+        openai_client: OpenAIClient,
         redis_service: RedisService,
     ):
         self.retrieval_service = retrieval_service
-        self.groq_client = groq_client
+        self.openai_client = openai_client
         self.redis_service = redis_service
 
         # Initialize agents
-        self.intake_agent = IntakeAgent(groq_client=groq_client)
+        self.intake_agent = IntakeAgent(openai_client=openai_client)
         self.safety_agent = SafetyAgent()
-        self.legal_agent = LegalAgent(retrieval_service=retrieval_service, groq_client=groq_client)
-        self.emergency_handler = EmergencyHandler(groq_client=groq_client)
+        self.legal_agent = LegalAgent(retrieval_service=retrieval_service, openai_client=openai_client)
+        self.emergency_handler = EmergencyHandler(openai_client=openai_client)
         self.response_validator = ResponseValidator()
 
         # Track execution times
         self._execution_times: Dict[str, List[float]] = {}
 
+    @traceable(name="orchestrator.process_query")
     async def process_query(
         self, query: str, session_id: Optional[str] = None, user_id: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         Process a user query through the multi-agent pipeline.
-
-        Args:
-            query: User query
-            session_id: Optional session ID for conversation history
-            user_id: Optional user ID
-
-        Returns:
-            Dictionary with response and metadata
         """
         start_time = time.time()
         message_id = str(uuid.uuid4())
 
-        # Generate session ID if not provided
         if not session_id:
             session_id = str(uuid.uuid4())
+
+        logger.info("=" * 60)
+        logger.info("PIPELINE START | query='%s' | session=%s", query[:100], session_id[:8])
+        logger.info("=" * 60)
 
         # Get conversation history
         conversation_history = await self.redis_service.get_session(session_id)
@@ -86,12 +87,29 @@ class AgentOrchestrator:
 
         try:
             # Step 1: Intake - Classify query
+            step_time = time.time()
             await self.intake_agent.execute(context)
             self._track_time("intake", start_time)
+            logger.info(
+                "STEP 1 INTAKE (%.3fs) | category=%s intent=%s urgency=%s is_emergency=%s",
+                time.time() - step_time,
+                context.metadata.get("category"),
+                context.metadata.get("intent"),
+                context.metadata.get("urgency"),
+                context.metadata.get("is_emergency"),
+            )
 
             # Step 2: Safety check
+            step_time = time.time()
             safety_result = await self.safety_agent.execute(context)
+            logger.info(
+                "STEP 2 SAFETY (%.3fs) | safe=%s disclaimer=%s",
+                time.time() - step_time,
+                not safety_result.is_rejected(),
+                bool(context.metadata.get("disclaimer")),
+            )
             if safety_result.is_rejected():
+                logger.warning("PIPELINE REJECTED by SafetyAgent: %s", safety_result.message)
                 return self._format_response(
                     context=context,
                     response=safety_result.message or "Query not allowed.",
@@ -102,18 +120,60 @@ class AgentOrchestrator:
                 )
 
             # Step 3: Legal retrieval
+            step_time = time.time()
             await self.legal_agent.execute(context)
             self._track_time("legal", time.time())
+            docs = context.metadata.get("retrieved_documents", [])
+            logger.info(
+                "STEP 3 LEGAL (%.3fs) | document_count=%d has_relevant_info=%s citations=%d",
+                time.time() - step_time,
+                len(docs),
+                context.metadata.get("has_relevant_info"),
+                len(context.metadata.get("citations", [])),
+            )
 
             # Step 4: Handle emergency if needed
             if context.metadata.get("is_emergency"):
+                step_time = time.time()
                 await self.emergency_handler.execute(context)
+                logger.info(
+                    "STEP 4 EMERGENCY (%.3fs) | emergency response generated",
+                    time.time() - step_time,
+                )
             else:
-                # Step 5: Generate response
-                await self._generate_response(context)
+                docs = context.metadata.get("retrieved_documents", [])
+                # If no documents were retrieved, return honest fallback instead of hallucinating
+                if not docs:
+                    context.metadata["generated_response"] = (
+                        "I wasn't able to find relevant information in the loaded legal documents "
+                        "to answer your question accurately.\n\n"
+                        "This may be because:\n"
+                        "- The specific topic isn't covered in the indexed documents yet\n"
+                        "- Try rephrasing your question with specific legal terms\n\n"
+                        "---\n\n"
+                        "**Disclaimer:** I am an AI assistant, not a qualified lawyer. "
+                        "For serious legal matters, please consult a qualified lawyer."
+                    )
+                    logger.info("STEP 5 GENERATE (0.000s) | no documents found — returning fallback")
+                else:
+                    # Step 5: Generate response from retrieved documents
+                    step_time = time.time()
+                    await self._generate_response(context)
+                    response_text = context.metadata.get("generated_response", "")
+                    logger.info(
+                        "STEP 5 GENERATE (%.3fs) | response_length=%d chars",
+                        time.time() - step_time,
+                        len(response_text),
+                    )
 
             # Step 6: Validate response
+            step_time = time.time()
             await self.response_validator.execute(context)
+            logger.info(
+                "STEP 6 VALIDATE (%.3fs) | validated=%s",
+                time.time() - step_time,
+                bool(context.metadata.get("generated_response")),
+            )
 
             # Get final response
             response = context.metadata.get("generated_response", "")
@@ -121,17 +181,31 @@ class AgentOrchestrator:
             # Save to conversation history
             await self._save_to_history(session_id, query, response)
 
+            total_time = time.time() - start_time
+            logger.info("=" * 60)
+            logger.info(
+                "PIPELINE COMPLETE | total_time=%.3fs | response_length=%d",
+                total_time,
+                len(response),
+            )
+            logger.info("=" * 60)
+
             # Format response
             return self._format_response(
                 context=context,
                 response=response,
                 message_id=message_id,
                 session_id=session_id,
-                execution_time=time.time() - start_time,
+                execution_time=total_time,
             )
 
         except Exception as e:
-            # Log error and return error response
+            logger.error(
+                "PIPELINE ERROR after %.3fs | error=%s",
+                time.time() - start_time,
+                str(e),
+                exc_info=True,
+            )
             return self._format_response(
                 context=context,
                 response="I apologize, but I encountered an error processing your request. Please try again.",
@@ -141,14 +215,14 @@ class AgentOrchestrator:
                 error=str(e),
             )
 
+    @traceable(name="orchestrator.generate_response")
     async def _generate_response(self, context: AgentContext):
-        """Generate response using Groq LLM."""
+        """Generate response using OpenAI LLM."""
         query = context.query
         documents = context.metadata.get("retrieved_documents", [])
         conversation_history = context.conversation_history or []
 
-        # Generate legal response
-        response = await self.groq_client.generate_legal_response(
+        response = await self.openai_client.generate_legal_response(
             query=query, context=documents, conversation_history=conversation_history
         )
 
@@ -314,7 +388,7 @@ class StreamingOrchestrator(AgentOrchestrator):
             {"role": "user", "content": f"Context:\n{context_str}\n\nQuestion: {query}"},
         ]
 
-        async for chunk in self.groq_client.stream_chat(messages):
+        async for chunk in self.openai_client.stream_chat(messages):
             if chunk.choices and chunk.choices[0].delta.content:
                 content = chunk.choices[0].delta.content
                 full_response += content

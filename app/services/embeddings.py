@@ -1,77 +1,92 @@
 """
 Embeddings Service for Legal Documents.
-Handles vector embeddings using sentence-transformers and ChromaDB.
+Handles vector embeddings using OpenAI and Pinecone.
 """
 
 import asyncio
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import chromadb
-from sentence_transformers import SentenceTransformer
+from openai import AsyncOpenAI
+from pinecone import Pinecone, ServerlessSpec
 
 from app.config import settings
 from app.services.chunker import LegalChunk
 
 
+def _sanitize_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """Sanitize metadata values to Pinecone-compatible types (str/int/float/bool/list[str])."""
+    sanitized = {}
+    for key, value in metadata.items():
+        if value is None:
+            continue
+        if isinstance(value, (str, int, float, bool)):
+            sanitized[key] = value
+        elif isinstance(value, list):
+            sanitized[key] = [str(v) for v in value]
+        else:
+            sanitized[key] = str(value)
+    return sanitized
+
+
 class EmbeddingService:
     """
     Manage embeddings and vector database for legal documents.
+    Uses Pinecone as the vector store.
     """
 
     def __init__(
         self,
-        persist_directory: Optional[Path] = None,
-        embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
-        collection_name: str = "legal_documents",
+        pinecone_api_key: str,
+        index_name: str = "mmara-legal",
+        namespace: str = "legal_documents",
+        embedding_model: str = "text-embedding-3-small",
+        openai_api_key: Optional[str] = None,
     ):
-        self.collection_name = collection_name
-        self.persist_directory = persist_directory or Path("./data/chroma_db")
+        self.index_name = index_name
+        self.namespace = namespace
         self.embedding_model_name = embedding_model
+        self._embedding_dim = 1536  # OpenAI text-embedding-3-small dimension
 
-        # Initialize embedding model (load in background to avoid blocking)
-        self._model: Optional[SentenceTransformer] = None
-        self._embedding_dim = 384  # Default for all-MiniLM-L6-v2
+        # Initialize OpenAI client
+        self.openai_client = AsyncOpenAI(api_key=openai_api_key or settings.openai_api_key)
 
-        # Initialize ChromaDB
-        self.client = chromadb.PersistentClient(path=str(self.persist_directory))
+        # Initialize Pinecone
+        self.pc = Pinecone(api_key=pinecone_api_key)
 
-        # Get or create collection
-        self.collection = self.client.get_or_create_collection(
-            name=collection_name, metadata={"hnsw:space": "cosine"}
-        )
-
-    @property
-    def model(self) -> SentenceTransformer:
-        """Lazy load the embedding model."""
-        if self._model is None:
-            self._model = SentenceTransformer(
-                self.embedding_model_name, device=settings.embedding_device
+        # Auto-create index if it doesn't exist
+        existing_indexes = [idx.name for idx in self.pc.list_indexes()]
+        if index_name not in existing_indexes:
+            self.pc.create_index(
+                name=index_name,
+                dimension=self._embedding_dim,
+                metric="cosine",
+                spec=ServerlessSpec(cloud="aws", region="us-east-1"),
             )
-            self._embedding_dim = self._model.get_sentence_embedding_dimension()
-        return self._model
 
-    def embed_text(self, text: str) -> List[float]:
-        """Generate embedding for a single text."""
-        return self.model.encode(text).tolist()
-
-    def embed_batch(self, texts: List[str]) -> List[List[float]]:
-        """Generate embeddings for multiple texts."""
-        return self.model.encode(texts, show_progress_bar=True).tolist()
+        self.index = self.pc.Index(index_name)
 
     async def embed_text_async(self, text: str) -> List[float]:
-        """Async wrapper for embedding single text."""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self.embed_text, text)
+        """Generate embedding for a single text using OpenAI."""
+        response = await self.openai_client.embeddings.create(
+            input=text,
+            model=self.embedding_model_name,
+        )
+        return response.data[0].embedding
 
     async def embed_batch_async(self, texts: List[str]) -> List[List[float]]:
-        """Async wrapper for embedding batch."""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self.embed_batch, texts)
+        """Generate embeddings for multiple texts using OpenAI."""
+        response = await self.openai_client.embeddings.create(
+            input=texts,
+            model=self.embedding_model_name,
+        )
+        # Sort by index to preserve order
+        return [item.embedding for item in sorted(response.data, key=lambda x: x.index)]
 
     async def add_chunks(self, chunks: List[LegalChunk], batch_size: int = 100) -> int:
         """
-        Add document chunks to the vector database.
+        Add document chunks to Pinecone.
+
+        Stores chunk text inside metadata["text"] (well within 40KB limit at ~512 chars).
 
         Args:
             chunks: List of LegalChunk objects
@@ -85,18 +100,21 @@ class EmbeddingService:
         for i in range(0, total_chunks, batch_size):
             batch = chunks[i : i + batch_size]
 
-            # Prepare data for ChromaDB
             ids = [chunk.chunk_id for chunk in batch]
             texts = [chunk.text for chunk in batch]
-            metadatas = [chunk.metadata for chunk in batch]
 
             # Generate embeddings
             embeddings = await self.embed_batch_async(texts)
 
-            # Add to collection
-            self.collection.add(
-                ids=ids, embeddings=embeddings, documents=texts, metadatas=metadatas
-            )
+            # Build upsert vectors with text stored in metadata
+            vectors = []
+            for chunk_id, embedding, chunk in zip(ids, embeddings, batch):
+                meta = _sanitize_metadata(chunk.metadata)
+                meta["text"] = chunk.text
+                vectors.append({"id": chunk_id, "values": embedding, "metadata": meta})
+
+            # Upsert to Pinecone
+            self.index.upsert(vectors=vectors, namespace=self.namespace)
 
             print(f"  Added {i + len(batch)}/{total_chunks} chunks")
 
@@ -108,53 +126,66 @@ class EmbeddingService:
         """
         Search for similar documents.
 
-        Args:
-            query: Search query text
-            n_results: Number of results to return
-            filter_metadata: Optional metadata filter
-
-        Returns:
-            Dictionary with search results
+        Returns results in ChromaDB-compatible format so RetrievalService needs minimal changes:
+        {"ids": [[...]], "distances": [[...]], "metadatas": [[...]], "documents": [[...]]}
         """
         query_embedding = await self.embed_text_async(query)
 
-        results = self.collection.query(
-            query_embeddings=[query_embedding], n_results=n_results, where=filter_metadata
+        results = self.index.query(
+            vector=query_embedding,
+            top_k=n_results,
+            include_metadata=True,
+            namespace=self.namespace,
+            filter=filter_metadata,
         )
 
-        return results
+        # Convert to ChromaDB-compatible format
+        ids = []
+        distances = []
+        metadatas = []
+        documents = []
 
-    def get_collection_stats(self) -> Dict[str, Any]:
-        """Get statistics about the collection."""
-        count = self.collection.count()
-
-        # Get a sample to infer metadata structure
-        sample = self.collection.get(limit=1)
+        for match in results.get("matches", []):
+            ids.append(match["id"])
+            # Convert Pinecone similarity score to distance: distance = 1 - score
+            distances.append(1 - match["score"])
+            meta = dict(match.get("metadata", {}))
+            text = meta.pop("text", "")
+            metadatas.append(meta)
+            documents.append(text)
 
         return {
-            "name": self.collection_name,
+            "ids": [ids],
+            "distances": [distances],
+            "metadatas": [metadatas],
+            "documents": [documents],
+        }
+
+    def get_collection_stats(self) -> Dict[str, Any]:
+        """Get statistics about the Pinecone index."""
+        stats = self.index.describe_index_stats()
+        ns_stats = stats.get("namespaces", {}).get(self.namespace, {})
+        count = ns_stats.get("vector_count", 0)
+
+        return {
+            "name": self.index_name,
             "total_documents": count,
             "embedding_model": self.embedding_model_name,
             "has_data": count > 0,
-            "sample_metadata_keys": (
-                list(sample["metadatas"][0].keys()) if sample["metadatas"] else []
-            ),
+            "sample_metadata_keys": [],
         }
 
     def delete_collection(self):
-        """Delete the current collection."""
-        self.client.delete_collection(self.collection_name)
+        """Delete all vectors in the namespace."""
+        self.index.delete(delete_all=True, namespace=self.namespace)
 
     def rebuild_collection(self):
-        """Delete and recreate the collection."""
+        """Delete all vectors and start fresh (namespace is reusable)."""
         self.delete_collection()
-        self.collection = self.client.get_or_create_collection(
-            name=self.collection_name, metadata={"hnsw:space": "cosine"}
-        )
 
     async def get_documents_by_ids(self, ids: List[str]) -> List[Dict[str, Any]]:
         """
-        Retrieve documents by their IDs.
+        Retrieve documents by their IDs from Pinecone.
 
         Args:
             ids: List of document IDs
@@ -162,12 +193,12 @@ class EmbeddingService:
         Returns:
             List of document dictionaries
         """
-        result = self.collection.get(ids=ids, include=["documents", "metadatas"])
+        result = self.index.fetch(ids=ids, namespace=self.namespace)
 
         documents = []
-        for i, doc_id in enumerate(result["ids"]):
-            documents.append(
-                {"id": doc_id, "text": result["documents"][i], "metadata": result["metadatas"][i]}
-            )
+        for doc_id, vector_data in result.get("vectors", {}).items():
+            meta = dict(vector_data.get("metadata", {}))
+            text = meta.pop("text", "")
+            documents.append({"id": doc_id, "text": text, "metadata": meta})
 
         return documents

@@ -4,17 +4,26 @@ Uses Pydantic Settings for type-safe configuration.
 """
 
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+def parse_cors_origins(v: Any) -> List[str]:
+    """Parse CORS origins from comma-separated string or list."""
+    if isinstance(v, str):
+        return [origin.strip() for origin in v.split(",")]
+    return v
 
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
     model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", case_sensitive=False, extra="ignore"
+        env_file=str(Path(__file__).parent.parent / ".env"),
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore"
     )
 
     # Application
@@ -28,38 +37,47 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
     cors_origins: List[str] = Field(
-        default=["http://localhost:3000", "http://localhost:19006"], alias="CORS_ORIGINS"
+        default=["http://localhost:3000", "http://localhost:19006"],
+        validate_default=True,
     )
 
     # Database - PostgreSQL
     database_url: str = Field(
-        default="postgresql+asyncpg://mmara:mmara@localhost:5432/mmara", alias="DATABASE_URL"
+        default="", alias="DATABASE_URL"
     )
     database_echo: bool = False
 
     # Redis
+    # Formats:
+    # - redis://localhost:6379/0 (no password)
+    # - redis://:password@localhost:6379/0 (with password)
+    # - rediss://:password@localhost:6379/0 (with password and SSL)
     redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
     redis_cache_ttl: int = 3600  # 1 hour
+    redis_max_connections: int = Field(default=50, alias="REDIS_MAX_CONNECTIONS")
 
     # JWT Authentication
-    secret_key: str = Field(default="change-this-secret-key-in-production", alias="SECRET_KEY")
+    secret_key: str = Field(default="dev-only-change-in-production-not-secure", alias="SECRET_KEY")
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 60 * 24  # 24 hours
     refresh_token_expire_days: int = 7
 
-    # Groq API
-    groq_api_key: Optional[str] = Field(None, alias="GROQ_API_KEY")
-    groq_model: str = "llama-3.1-70b-versatile"
-    groq_temperature: float = 0.1
-    groq_max_tokens: int = 2000
+    # OpenAI API
+    openai_api_key: Optional[str] = Field(None, alias="OPENAI_API_KEY")
+    openai_model: str = "gpt-4o-mini"
+    openai_temperature: float = 0.1
+    openai_max_tokens: int = 2000
 
-    # Embeddings
-    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
-    embedding_device: str = "cpu"  # or "cuda" if available
+    # Embeddings (OpenAI)
+    embedding_model: str = "text-embedding-3-small"  # 1536-dim
 
-    # ChromaDB
-    chroma_persist_directory: str = Field(default="./data/chroma_db", alias="CHROMA_PERSIST_DIR")
-    chroma_collection_name: str = "legal_documents"
+    # LlamaParse
+    llamaparse_api_key: Optional[str] = Field(None, alias="LLAMAPARSE_API_KEY")
+
+    # Pinecone
+    pinecone_api_key: Optional[str] = Field(None, alias="PINECONE_API_KEY")
+    pinecone_index_name: str = Field(default="mmara-legal", alias="PINECONE_INDEX_NAME")
+    pinecone_namespace: str = Field(default="legal_documents", alias="PINECONE_NAMESPACE")
 
     # Document Paths
     criminal_docs_path: str = Field(default="../Criminal_proceeding", alias="CRIMINAL_DOCS_PATH")
@@ -81,12 +99,51 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_format: str = "json"  # or "text"
 
+    # Email Configuration
+    frontend_url: str = Field(default="http://localhost:3000", alias="FRONTEND_URL")
+    smtp_host: Optional[str] = Field(None, alias="SMTP_HOST")
+    smtp_port: int = Field(587, alias="SMTP_PORT")
+    smtp_use_tls: bool = Field(True, alias="SMTP_USE_TLS")
+    smtp_username: Optional[str] = Field(None, alias="SMTP_USERNAME")
+    smtp_password: Optional[str] = Field(None, alias="SMTP_PASSWORD")
+    smtp_from_email: Optional[str] = Field(None, alias="SMTP_FROM_EMAIL")
+    smtp_from_name: str = Field("MMara Legal AI", alias="SMTP_FROM_NAME")
+
     @field_validator("cors_origins", mode="before")
     @classmethod
-    def parse_cors_origins(cls, v):
+    def parse_cors_origins(cls, v: Any) -> Any:
+        """Parse CORS origins from comma-separated string or list."""
         if isinstance(v, str):
             return [origin.strip() for origin in v.split(",")]
         return v
+
+    @model_validator(mode="after")
+    def validate_security_settings(self) -> "Settings":
+        """Validate that critical security settings are properly configured."""
+        errors = []
+
+        # In production, require secure credentials
+        if self.environment == "production":
+            if not self.secret_key or len(self.secret_key) < 32:
+                errors.append(
+                    "SECRET_KEY must be set and at least 32 characters in production"
+                )
+            if not self.database_url:
+                errors.append("DATABASE_URL must be set in production")
+
+            # Check for obvious placeholder values
+            placeholder_keys = [
+                "change-this-secret-key",
+                "your-secret-key",
+                "replace-with-secret",
+            ]
+            if any(placeholder in self.secret_key.lower() for placeholder in placeholder_keys):
+                errors.append("SECRET_KEY appears to be a placeholder. Set a secure random key.")
+
+        if errors:
+            raise ValueError(f"Security configuration errors: {', '.join(errors)}")
+
+        return self
 
     @property
     def project_root(self) -> Path:
@@ -109,12 +166,6 @@ class Settings(BaseSettings):
         """Get the resolved road traffic documents path."""
         path = Path(self.road_traffic_docs_path)
         return path if path.is_absolute() else self.project_root.parent / path
-
-    @property
-    def chroma_persist_directory_resolved(self) -> Path:
-        """Get the resolved ChromaDB persist directory."""
-        path = Path(self.chroma_persist_directory)
-        return path if path.is_absolute() else self.project_root / path
 
 
 # Global settings instance

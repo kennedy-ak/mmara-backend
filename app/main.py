@@ -4,17 +4,19 @@ MMara Backend - FastAPI Application Entry Point
 An AI-powered legal first-aid assistant for Ghanaians.
 """
 
+import asyncio
 import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Callable
 
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.api.v1 import admin, auth, chat, users
 from app.config import settings
@@ -44,6 +46,75 @@ Most endpoints require JWT authentication. Use `/api/v1/auth/login` to get a tok
 API_VERSION = "1.0.0"
 
 
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """
+    Middleware to add security headers to all responses.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        """Process request and add security headers to response."""
+        response: Response = await call_next(request)
+
+        # Prevent MIME type sniffing
+        response.headers["X-Content-Type-Options"] = "nosniff"
+
+        # Prevent clickjacking
+        response.headers["X-Frame-Options"] = "DENY"
+
+        # Enable XSS filter (legacy but still useful)
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+
+        # Referrer policy
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+
+        # Content Security Policy (basic, can be customized)
+        if settings.environment == "production":
+            # Strict CSP for production
+            csp = (
+                "default-src 'self'; "
+                "script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
+                "style-src 'self' 'unsafe-inline'; "
+                "img-src 'self' data: https:; "
+                "font-src 'self'; "
+                "connect-src 'self'; "
+                "frame-ancestors 'none'; "
+                "base-uri 'self'; "
+                "form-action 'self';"
+            )
+        else:
+            # More lenient CSP for development
+            csp = (
+                "default-src 'self'; "
+                "script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
+                "style-src 'self' 'unsafe-inline'; "
+                "img-src 'self' data: https:; "
+                "font-src 'self'; "
+                "connect-src 'self' http://localhost:* ws://localhost:*; "
+                "frame-ancestors 'self'; "
+            )
+
+        response.headers["Content-Security-Policy"] = csp
+
+        # HSTS (HTTP Strict Transport Security) - only in production with HTTPS
+        if settings.environment == "production":
+            # Strict HSTS for 1 year
+            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains; preload"
+
+        # Permissions policy (formerly Feature-Policy)
+        response.headers["Permissions-Policy"] = (
+            "geolocation=(), "
+            "microphone=(), "
+            "camera=(), "
+            "payment=(), "
+            "usb=(), "
+            "magnetometer=(), "
+            "gyroscope=(), "
+            "accelerometer=()"
+        )
+
+        return response
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
@@ -56,6 +127,17 @@ async def lifespan(app: FastAPI):
         logger.info("Database initialized")
     except Exception as e:
         logger.error(f"Database initialization failed: {e}")
+
+    # Pre-build BM25 index in the background (non-blocking)
+    try:
+        from app.dependencies import get_embedding_service, get_retrieval_service
+
+        emb = await get_embedding_service()
+        ret = await get_retrieval_service(emb)
+        asyncio.create_task(ret.build_bm25_index())
+        logger.info("BM25 index build started in background")
+    except Exception as e:
+        logger.warning(f"Could not start BM25 background build: {e}")
 
     yield
 
@@ -86,6 +168,9 @@ app.add_middleware(
 
 # GZip middleware
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# Security headers middleware
+app.add_middleware(SecurityHeadersMiddleware)
 
 
 # Request ID middleware
@@ -194,7 +279,10 @@ async def health_check():
 
 @app.get("/metrics", tags=["Monitoring"])
 async def get_metrics():
-    """Get application metrics."""
+    """Get application metrics (debug mode only)."""
+    if not settings.debug:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Not found")
     return metrics.get_all_metrics()
 
 

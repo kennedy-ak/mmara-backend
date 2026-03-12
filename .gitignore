@@ -7,36 +7,108 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+.pytest_cache/
+.coverage
+htmlcov/
 
 # Virtual environments
 venv/
 env/
 .venv/
+virtualenv/
 
 # Environment variables
 .env
+.env.local
+.env.*.local
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+.project
+.pydevproject
+.settings/
 
 # Testing
-.pytest_cache/
+.tox/
 .coverage
-htmlcov/
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
 
 # Database
 *.db
 *.sqlite
+*.sqlite3
 
 # Logs
 *.log
+logs/
 
-# ChromaDB
+# Uploaded documents (should be stored externally)
+data/uploads/
+data/*.pdf
+data/*.doc*
+data/*.ppt*
+
+# ChromaDB / Vector stores
 data/chroma/
+data/vector_stores/
 
 # OS
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
+desktop.ini
+
+# Package managers
+node_modules/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# UV lock file (can be regenerated)
+uv.lock
+
+# Documentation drafts (keep CLAUDE.md)
+*.md.backup
+*.md.tmp
+PLAN_*.md
+NOTES_*.md
+
+# Transcripts
+transcripts/
+*.jsonl
+*.transcript
+
+# Session files
+*.session
+*.pid
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp
+
+# Deployment
+.dockerignore
+deploy/
+terraform/
+
+# Secrets (just in case)
+*.pem
+*.key
+*.cert
+*.crt
+secrets/

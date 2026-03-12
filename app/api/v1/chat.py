@@ -4,6 +4,7 @@ Handles user queries and conversation management.
 """
 
 import time
+from datetime import datetime, timezone
 from typing import Annotated, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
@@ -66,7 +67,7 @@ async def send_message(
         None,  # Request object not available here
         redis,
         current_user.id if current_user else None,
-        current_user.is_premium if current_user else False,
+        False,
     )
 
     # Get or create session
@@ -88,7 +89,7 @@ async def send_message(
     if session:
         # Update existing session
         session.message_count += 1
-        session.updated_at = result["timestamp"]
+        session.updated_at = datetime.now(timezone.utc)
     else:
         # Create new session
         session = ChatSession(
@@ -275,9 +276,9 @@ async def submit_feedback(
 @router.websocket("/chat/stream")
 async def websocket_chat(
     websocket: WebSocket,
+    redis_svc: RedisSvc,
+    orchestrator: OrchestratorSvc,
     db: AsyncSession = Depends(async_session_maker),
-    redis_svc: RedisSvc = Depends(),
-    orchestrator: OrchestratorSvc = Depends(),
 ):
     """
     WebSocket endpoint for streaming chat responses.

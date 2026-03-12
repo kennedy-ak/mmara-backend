@@ -3,11 +3,15 @@ Admin API endpoints.
 Handles document management and system administration.
 """
 
+import logging
+import re
 import time
 from pathlib import Path
-from typing import Annotated, List
+from typing import List, Set
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+logger = logging.getLogger("mmara")
+
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
 from sqlalchemy import func, select
 
 from app.config import settings
@@ -20,50 +24,149 @@ from app.models.document import (
     RetrievalRequest,
     RetrievalResult,
 )
-from app.models.user import UserInDB
 from app.services.chunker import LegalDocumentChunker
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
+
+# Security constants
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+ALLOWED_CATEGORIES: Set[str] = {"criminal", "road_traffic", "general"}
+ALLOWED_DOC_TYPES: Set[str] = {"act", "amendment", "regulation", "legislative_instrument", "other"}
+ALLOWED_EXTENSIONS = {".pdf"}
+
+
+def sanitize_filename(filename: str) -> str:
+    """
+    Sanitize filename to prevent path traversal attacks.
+
+    Args:
+        filename: Original filename
+
+    Returns:
+        str: Sanitized safe filename
+    """
+    # Remove any path components
+    filename = Path(filename).name
+
+    # Remove null bytes
+    filename = filename.replace("\x00", "")
+
+    # Replace any characters that aren't alphanumeric, dash, underscore, or dot
+    filename = re.sub(r"[^a-zA-Z0-9._-]", "_", filename)
+
+    # Ensure filename isn't empty after sanitization
+    if not filename:
+        filename = "unnamed_file.pdf"
+
+    # Limit filename length
+    name, ext = Path(filename).stem, Path(filename).suffix
+    if len(name) > 100:
+        name = name[:100]
+    filename = f"{name}{ext}"
+
+    return filename
+
+
+def validate_pdf_content(content: bytes) -> bool:
+    """
+    Validate that the file content is actually a PDF.
+
+    Args:
+        content: File content as bytes
+
+    Returns:
+        bool: True if content appears to be a valid PDF
+    """
+    # PDF files should start with %PDF- (magic number)
+    if len(content) < 5:
+        return False
+    return content[:4] == b"%PDF"
 
 
 @router.post(
     "/documents", response_model=DocumentInfo, status_code=status.HTTP_201_CREATED
 )
 async def upload_document(
-    current_user: Annotated[UserInDB, Depends(AdminUser)],
+    current_user: AdminUser,
     db: DBSession,
     embedding_service: EmbeddingSvc,
     file: UploadFile = File(...),
-    category: str = "general",
-    doc_type: str = "other",
+    category: str = Form("general"),
+    doc_type: str = Form("other"),
 ):
     """
     Upload a legal document PDF to be processed and indexed.
 
-    - **file**: PDF file to upload
+    - **file**: PDF file to upload (max 50MB)
     - **category**: Document category (criminal, road_traffic, general)
     - **doc_type**: Document type (act, amendment, regulation, legislative_instrument, other)
 
     Requires admin privileges.
     """
-    # Validate file type
-    if not file.filename or not file.filename.lower().endswith('.pdf'):
+    # Validate category
+    if category not in ALLOWED_CATEGORIES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only PDF files are supported"
+            detail=f"Invalid category. Must be one of: {', '.join(ALLOWED_CATEGORIES)}"
+        )
+
+    # Validate doc_type
+    if doc_type not in ALLOWED_DOC_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid doc_type. Must be one of: {', '.join(ALLOWED_DOC_TYPES)}"
+        )
+
+    # Validate file exists and has name
+    if not file.filename:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Filename is required"
+        )
+
+    # Validate file extension
+    file_ext = Path(file.filename).suffix.lower()
+    if file_ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Only PDF files are supported. Got: {file_ext}"
+        )
+
+    # Read and validate file content
+    content = await file.read()
+
+    # Check file size
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB"
+        )
+
+    if len(content) == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="File is empty"
+        )
+
+    # Validate PDF magic number
+    if not validate_pdf_content(content):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid PDF file. File does not appear to be a valid PDF."
         )
 
     # Create documents directory if needed
-    upload_dir = embedding_service.persist_directory / "uploads"
+    upload_dir = settings.data_dir / "uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save file
+    # Sanitize filename
+    safe_original_filename = sanitize_filename(file.filename)
     timestamp = int(time.time())
-    safe_filename = f"{timestamp}_{file.filename}"
+    safe_filename = f"{timestamp}_{safe_original_filename}"
     file_path = upload_dir / safe_filename
 
+    # Save file
     with open(file_path, "wb") as f:
-        content = await file.read()
         f.write(content)
 
     # Create database entry
@@ -99,7 +202,7 @@ async def upload_document(
 
 @router.get("/documents", response_model=List[DocumentInfo])
 async def list_documents(
-    current_user: Annotated[UserInDB, Depends(AdminUser)],
+    current_user: AdminUser,
     db: DBSession,
     skip: int = 0,
     limit: int = 50
@@ -138,7 +241,7 @@ async def list_documents(
 @router.delete("/documents/{document_id}")
 async def delete_document(
     document_id: int,
-    current_user: Annotated[UserInDB, Depends(AdminUser)],
+    current_user: AdminUser,
     db: DBSession,
     embedding_service: EmbeddingSvc
 ):
@@ -166,8 +269,14 @@ async def delete_document(
     await db.delete(document)
     await db.commit()
 
-    # Note: Chunks in ChromaDB would need to be deleted separately
-    # by filtering on source_file metadata
+    # Delete associated chunks from Pinecone by source_file metadata
+    try:
+        embedding_service.index.delete(
+            filter={"source_file": document.original_filename},
+            namespace=embedding_service.namespace,
+        )
+    except Exception:
+        pass  # Best-effort deletion; document row is already removed
 
     return {"message": "Document deleted successfully"}
 
@@ -175,7 +284,7 @@ async def delete_document(
 @router.post("/reindex")
 async def reindex_documents(
     request: ReindexRequest,
-    current_user: Annotated[UserInDB, Depends(AdminUser)],
+    current_user: AdminUser,
     embedding_service: EmbeddingSvc
 ):
     """
@@ -199,7 +308,7 @@ async def reindex_documents(
 @router.post("/retrieve", response_model=List[RetrievalResult])
 async def test_retrieval(
     request: RetrievalRequest,
-    current_user: Annotated[UserInDB, Depends(AdminUser)],
+    current_user: AdminUser,
     retrieval_service: RetrievalSvc
 ):
     """
@@ -234,7 +343,7 @@ async def test_retrieval(
 
 @router.get("/stats", response_model=DocumentStats)
 async def get_document_stats(
-    current_user: Annotated[UserInDB, Depends(AdminUser)],
+    current_user: AdminUser,
     db: DBSession,
     embedding_service: EmbeddingSvc
 ):
@@ -243,8 +352,8 @@ async def get_document_stats(
 
     Requires admin privileges.
     """
-    # Get ChromaDB stats
-    chroma_stats = embedding_service.get_collection_stats()
+    # Get vector DB stats
+    vector_stats = embedding_service.get_collection_stats()
 
     # Get database stats
     doc_count_result = await db.execute(
@@ -281,64 +390,88 @@ async def get_document_stats(
 
     return DocumentStats(
         total_documents=total_docs,
-        total_chunks=chroma_stats["total_documents"],
+        total_chunks=vector_stats["total_documents"],
         by_category=category_stats,
         by_doc_type=doc_type_stats,
-        last_updated=last_updated or time.time()
+        last_updated=last_updated
     )
 
 
 @router.post("/process-pending")
 async def process_pending_documents(
-    current_user: Annotated[UserInDB, Depends(AdminUser)],
+    current_user: AdminUser,
     db: DBSession,
-    embedding_service: EmbeddingSvc
+    embedding_service: EmbeddingSvc,
+    retrieval_service: RetrievalSvc,
 ):
     """
     Process all pending documents.
 
     Requires admin privileges.
     """
-    # Get pending documents
+    # Get pending and failed documents (retry failed ones too)
     result = await db.execute(
-        select(Document).where(Document.status == "pending")
+        select(Document).where(Document.status.in_(["pending", "failed"]))
     )
     documents = result.scalars().all()
 
     processed = 0
+    errors = []
     for document in documents:
         try:
             file_path = Path(document.file_path) if document.file_path else None
-            if file_path and file_path.exists():
-                # Process the document
-                chunker = LegalDocumentChunker(
-                    chunk_size=settings.chunk_size,
-                    chunk_overlap=settings.chunk_overlap
-                )
-                chunks = await chunker.chunk_document_async(file_path)
+            if not file_path or not file_path.exists():
+                error_msg = f"File not found: {document.file_path}"
+                logger.error(f"Document {document.id} ({document.original_filename}): {error_msg}")
+                document.status = "failed"
+                document.doc_metadata = document.doc_metadata or {}
+                document.doc_metadata["error"] = error_msg
+                errors.append({"id": document.id, "filename": document.original_filename, "error": error_msg})
+                continue
 
-                # Add category to chunks
-                for chunk in chunks:
-                    chunk.metadata["category"] = document.category
+            logger.info(f"Processing document {document.id}: {document.original_filename}")
+            document.status = "processing"
+            await db.commit()
 
-                # Add to embedding service
-                await embedding_service.add_chunks(chunks)
+            # Process the document
+            chunker = LegalDocumentChunker(
+                chunk_size=settings.chunk_size,
+                chunk_overlap=settings.chunk_overlap
+            )
+            chunks = await chunker.chunk_document_async(file_path)
 
-                # Update document status
-                document.status = "processed"
-                document.chunk_count = len(chunks)
-                document.processed_at = func.now()
-                processed += 1
+            logger.info(f"Document {document.id}: extracted {len(chunks)} chunks")
+
+            # Add category to chunks
+            for chunk in chunks:
+                chunk.metadata["category"] = document.category
+
+            # Add to embedding service
+            await embedding_service.add_chunks(chunks)
+
+            # Update document status
+            document.status = "processed"
+            document.chunk_count = len(chunks)
+            document.processed_at = func.now()
+            processed += 1
 
         except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Document {document.id} ({document.original_filename}) failed: {error_msg}", exc_info=True)
             document.status = "failed"
-            document.metadata = document.metadata or {}
-            document.metadata["error"] = str(e)
+            document.doc_metadata = document.doc_metadata or {}
+            document.doc_metadata["error"] = error_msg
+            errors.append({"id": document.id, "filename": document.original_filename, "error": error_msg})
 
     await db.commit()
 
+    # Invalidate BM25 index so it rebuilds with new documents on next search
+    if processed > 0:
+        retrieval_service.invalidate_bm25_index()
+
     return {
-        "message": f"Processed {processed} of {len(documents)} pending documents",
+        "message": f"Processed {processed} of {len(documents)} documents",
         "processed": processed,
-        "total": len(documents)
+        "total": len(documents),
+        "errors": errors,
     }

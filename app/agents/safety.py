@@ -200,9 +200,9 @@ class EmergencyHandler(BaseAgent):
     Handles emergency queries with prioritized responses.
     """
 
-    def __init__(self, groq_client=None):
+    def __init__(self, openai_client=None):
         super().__init__()
-        self.groq_client = groq_client
+        self.openai_client = openai_client
 
     @property
     def name(self) -> str:
@@ -226,8 +226,8 @@ class EmergencyHandler(BaseAgent):
         documents = context.metadata.get("retrieved_documents", [])
 
         # Generate emergency response
-        if self.groq_client:
-            response = await self.groq_client.generate_emergency_response(query, documents)
+        if self.openai_client:
+            response = await self.openai_client.generate_emergency_response(query, documents)
         else:
             response = self._generate_fallback_emergency_response(query, documents)
 
