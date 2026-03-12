@@ -4,6 +4,7 @@ Combines semantic search and BM25 for improved retrieval.
 """
 
 import asyncio
+import logging
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -12,12 +13,18 @@ from rank_bm25 import BM25Okapi
 
 from app.services.embeddings import EmbeddingService
 
+logger = logging.getLogger("mmara.retrieval")
+
+# Timeout for BM25 index building (seconds)
+BM25_BUILD_TIMEOUT = 30
+
 
 class RetrievalService:
     """
     Hybrid retriever combining vector search and BM25.
 
     Uses reciprocal rank fusion (RRF) to combine results.
+    Falls back to semantic-only search if BM25 index is unavailable.
     """
 
     def __init__(self, embedding_service: EmbeddingService, alpha: float = 0.7, rrf_k: int = 60):
@@ -37,22 +44,64 @@ class RetrievalService:
         self.doc_ids: List[str] = []
         self.metadatas: List[Dict] = []
         self._bm25_built = False
+        self._bm25_building = False
+        self._bm25_failed = False
 
     async def build_bm25_index(self):
-        """Build BM25 index from Pinecone vectors."""
-        if self._bm25_built:
+        """Build BM25 index from Pinecone vectors with timeout."""
+        if self._bm25_built or self._bm25_building:
             return
 
-        print("Building BM25 index from Pinecone...")
+        self._bm25_building = True
+        logger.info("Building BM25 index from Pinecone...")
 
-        index = self.embedding_service.index
-        namespace = self.embedding_service.namespace
+        try:
+            index = self.embedding_service.index
+            namespace = self.embedding_service.namespace
 
+            # Run with timeout to prevent hanging
+            all_ids, all_docs, all_metadata = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None, self._fetch_all_documents, index, namespace
+                ),
+                timeout=BM25_BUILD_TIMEOUT,
+            )
+
+            if not all_docs:
+                self._bm25_built = True
+                logger.info("BM25 index: no documents found")
+                return
+
+            # Tokenize documents for BM25
+            tokenized_docs = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: [self._tokenize(doc) for doc in all_docs]
+            )
+
+            self.documents = all_docs
+            self.doc_ids = all_ids
+            self.metadatas = all_metadata
+            self.bm25 = BM25Okapi(tokenized_docs)
+            self._bm25_built = True
+
+            logger.info(f"BM25 index built with {len(all_docs)} documents")
+
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"BM25 index build timed out after {BM25_BUILD_TIMEOUT}s. "
+                "Falling back to semantic-only search."
+            )
+            self._bm25_failed = True
+        except Exception as e:
+            logger.warning(f"BM25 index build failed: {e}. Falling back to semantic-only search.")
+            self._bm25_failed = True
+        finally:
+            self._bm25_building = False
+
+    def _fetch_all_documents(self, index, namespace):
+        """Synchronous helper to fetch all documents from Pinecone (runs in thread)."""
         all_docs = []
         all_ids = []
         all_metadata = []
-
-        # Use index.list() to paginate through all vector IDs, then fetch in batches
         batch_size = 100
         id_batch = []
 
@@ -69,7 +118,6 @@ class RetrievalService:
                         all_metadata.append(meta)
                     id_batch = []
 
-        # Fetch remaining
         if id_batch:
             fetched = index.fetch(ids=id_batch, namespace=namespace)
             for vid, vdata in fetched.get("vectors", {}).items():
@@ -79,24 +127,7 @@ class RetrievalService:
                 all_docs.append(text)
                 all_metadata.append(meta)
 
-        if not all_docs:
-            self._bm25_built = True
-            print("BM25 index: no documents found")
-            return
-
-        # Tokenize documents for BM25
-        loop = asyncio.get_event_loop()
-        tokenized_docs = await loop.run_in_executor(
-            None, lambda: [self._tokenize(doc) for doc in all_docs]
-        )
-
-        self.documents = all_docs
-        self.doc_ids = all_ids
-        self.metadatas = all_metadata
-        self.bm25 = BM25Okapi(tokenized_docs)
-        self._bm25_built = True
-
-        print(f"BM25 index built with {len(all_docs)} documents")
+        return all_ids, all_docs, all_metadata
 
     def invalidate_bm25_index(self):
         """Reset BM25 cache so it rebuilds on next search."""
@@ -145,7 +176,7 @@ class RetrievalService:
         Returns:
             List of (doc_id, score, metadata) tuples
         """
-        if not self._bm25_built:
+        if not self._bm25_built and not self._bm25_failed:
             await self.build_bm25_index()
 
         if not self.bm25:
@@ -251,13 +282,17 @@ class RetrievalService:
                 query, n_results=fetch_k, filter_metadata=filter_metadata
             )
 
-            # Keyword search
+            # Keyword search (returns [] if BM25 failed/unavailable)
             keyword_results = await self._keyword_search(query, n_results=fetch_k)
 
-            # Combine using RRF
-            fused_results = self._reciprocal_rank_fusion(
-                semantic_results, keyword_results, n_results=n_results
-            )
+            if keyword_results:
+                # Combine using RRF
+                fused_results = self._reciprocal_rank_fusion(
+                    semantic_results, keyword_results, n_results=n_results
+                )
+            else:
+                # BM25 unavailable — use semantic results only
+                fused_results = semantic_results[:n_results]
         else:
             # Semantic only
             fused_results = await self._semantic_search(
@@ -269,8 +304,12 @@ class RetrievalService:
         if not doc_ids:
             return []
 
-        fetched_raw = self.embedding_service.index.fetch(
-            ids=doc_ids, namespace=self.embedding_service.namespace
+        loop = asyncio.get_event_loop()
+        fetched_raw = await loop.run_in_executor(
+            None,
+            lambda: self.embedding_service.index.fetch(
+                ids=doc_ids, namespace=self.embedding_service.namespace
+            ),
         )
         vectors = fetched_raw.get("vectors", {})
 
@@ -315,8 +354,8 @@ class RetrievalService:
         Returns:
             Reranked results
         """
-        if not results:
-            return []
+        if not results or not openai_client:
+            return results[:top_k] if results else []
 
         reranked = await openai_client.rerank_results(query, results, top_k)
 

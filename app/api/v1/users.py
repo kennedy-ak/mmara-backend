@@ -15,7 +15,7 @@ router = APIRouter(prefix="/users", tags=["Users"])
 
 
 @router.get("/me", response_model=UserResponse)
-async def get_profile(current_user: Annotated[UserResponse, Depends(CurrentUser)]):
+async def get_profile(current_user: CurrentUser):
     """
     Get current user profile.
     """
@@ -24,7 +24,7 @@ async def get_profile(current_user: Annotated[UserResponse, Depends(CurrentUser)
 
 @router.put("/me", response_model=UserResponse)
 async def update_profile(
-    updates: UserUpdate, current_user: Annotated[UserResponse, Depends(CurrentUser)], db: DBSession
+    updates: UserUpdate, current_user: CurrentUser, db: DBSession
 ):
     """
     Update current user profile.
@@ -53,7 +53,7 @@ async def update_profile(
 
 @router.get("/me/stats", response_model=UserStats)
 async def get_user_stats(
-    current_user: Annotated[UserResponse, Depends(CurrentUser)], db: DBSession
+    current_user: CurrentUser, db: DBSession
 ):
     """
     Get current user statistics.
@@ -101,7 +101,7 @@ async def get_user_stats(
 
 @router.get("/", response_model=List[UserResponse])
 async def list_users(
-    current_user: Annotated[UserResponse, Depends(AdminUser)],
+    current_user: AdminUser,
     db: DBSession,
     skip: int = 0,
     limit: int = 50,
@@ -120,7 +120,7 @@ async def list_users(
 
 @router.get("/{user_id}", response_model=UserResponse)
 async def get_user(
-    user_id: int, current_user: Annotated[UserResponse, Depends(AdminUser)], db: DBSession
+    user_id: int, current_user: AdminUser, db: DBSession
 ):
     """
     Get a specific user by ID (Admin only).
@@ -136,7 +136,7 @@ async def get_user(
 
 @router.delete("/{user_id}")
 async def delete_user(
-    user_id: int, current_user: Annotated[UserResponse, Depends(AdminUser)], db: DBSession
+    user_id: int, current_user: AdminUser, db: DBSession
 ):
     """
     Delete a user (Admin only).

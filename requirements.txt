@@ -28,7 +28,7 @@ email-validator
 pinecone[grpc]
 # Retrieval & Reranking
 rank-bm25
-# OpenAI API (LLM + Embeddings)
+# OpenAI API (LLM + Embeddings + Reranking)
 openai
 # LangSmith Tracing
 langsmith

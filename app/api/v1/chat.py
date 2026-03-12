@@ -330,5 +330,5 @@ async def websocket_chat(
 
     except WebSocketDisconnect:
         pass
-    except Exception as e:
-        await websocket.send_json({"type": "error", "data": {"message": str(e)}})
+    except Exception:
+        await websocket.send_json({"type": "error", "data": {"message": "An internal error occurred"}})

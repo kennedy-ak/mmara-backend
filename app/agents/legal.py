@@ -104,7 +104,7 @@ class LegalAgent(BaseAgent):
 
     async def _retrieve(self, query: str, category: str, urgency: str) -> List[Dict[str, Any]]:
         """
-        Retrieve relevant legal documents.
+        Retrieve relevant legal documents using OpenAI reranking.
 
         Args:
             query: Optimized query
@@ -120,18 +120,21 @@ class LegalAgent(BaseAgent):
         # Use category filter if specified
         filter_metadata = {"category": category} if category != "general" else None
 
-        # For urgent queries, skip reranking for speed
-        use_rerank = urgency not in ["high", "critical"]
+        # For urgent queries, skip reranking for speed (~2s saved)
+        # For normal queries, use OpenAI reranking for better accuracy
+        use_rerank = urgency not in ["high", "critical"] and self.openai_client is not None
 
-        # Retrieve
-        if use_rerank and self.openai_client:
+        if use_rerank:
+            # Hybrid search + OpenAI LLM reranking
             results = await self.retrieval_service.retrieve_with_rerank(
                 query=query,
                 n_results=top_k,
                 filter_metadata=filter_metadata,
                 openai_client=self.openai_client,
+                fetch_k=15,  # Fetch more before reranking
             )
         else:
+            # Hybrid search only (faster)
             results = await self.retrieval_service.retrieve(
                 query=query, n_results=top_k, filter_metadata=filter_metadata
             )
