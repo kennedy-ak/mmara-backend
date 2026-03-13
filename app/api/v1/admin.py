@@ -16,12 +16,13 @@ import pytz
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import and_, func, select, or_
+from sqlalchemy.orm import selectinload
 from sqlalchemy.sql import text
 
 logger = logging.getLogger("mmara")
 
 from app.config import settings
-from app.db.models import Analytics, ChatSession, Document
+from app.db.models import Analytics, BugReport, ChatSession, Document, User
 from app.dependencies import AdminUser, DBSession, EmbeddingSvc, RetrievalSvc
 from app.models.document import (
     DocumentInfo,
@@ -29,6 +30,13 @@ from app.models.document import (
     ReindexRequest,
     RetrievalRequest,
     RetrievalResult,
+)
+from app.models.bug_report import (
+    BugReportCreate,
+    BugReportListResponse,
+    BugReportResponse,
+    BugReportUpdate,
+    BugStats,
 )
 from app.models.feedback import (
     AdminResponseRequest,
@@ -1048,3 +1056,424 @@ async def export_feedback(
                 "Content-Disposition": f"attachment; filename=feedback_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
             }
         )
+
+
+# ==================== Bug Report Management ====================
+
+@router.get("/bug-reports", response_model=BugReportListResponse)
+async def list_bug_reports(
+    current_user: AdminUser,
+    db: DBSession,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    status: Optional[str] = Query(None),
+    severity: Optional[str] = Query(None),
+    bug_type: Optional[str] = Query(None),
+):
+    """
+    List all bug reports with pagination and filters.
+
+    - **page**: Page number (1-indexed)
+    - **page_size**: Number of items per page (max 100)
+    - **status**: Filter by status (open, in_progress, resolved, closed)
+    - **severity**: Filter by severity (low, medium, high, critical)
+    - **bug_type**: Filter by bug type (ui, api, performance, accuracy, other)
+
+    Requires admin privileges.
+    """
+    from app.db.models import BugReport
+
+    # Build base query with eager loading
+    base_query = select(BugReport).options(
+        selectinload(BugReport.user),
+        selectinload(BugReport.assignee),
+        selectinload(BugReport.responder),
+    )
+
+    # Apply filters
+    if status:
+        valid_statuses = ["open", "in_progress", "resolved", "closed"]
+        if status not in valid_statuses:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid status. Must be one of: {', '.join(valid_statuses)}"
+            )
+        base_query = base_query.where(BugReport.status == status)
+
+    if severity:
+        valid_severities = ["low", "medium", "high", "critical"]
+        if severity not in valid_severities:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid severity. Must be one of: {', '.join(valid_severities)}"
+            )
+        base_query = base_query.where(BugReport.severity == severity)
+
+    if bug_type:
+        valid_types = ["ui", "api", "performance", "accuracy", "other"]
+        if bug_type not in valid_types:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid bug_type. Must be one of: {', '.join(valid_types)}"
+            )
+        base_query = base_query.where(BugReport.bug_type == bug_type)
+
+    # Get total count
+    count_query = select(func.count()).select_from(base_query.subquery())
+    total_result = await db.execute(count_query)
+    total = total_result.scalar() or 0
+
+    # Calculate pagination
+    total_pages = (total + page_size - 1) // page_size
+    offset = (page - 1) * page_size
+
+    # Execute paginated query
+    query = base_query.order_by(BugReport.created_at.desc()).offset(offset).limit(page_size)
+    result = await db.execute(query)
+    bug_reports = result.scalars().all()
+
+    # Build response items
+    items = []
+    for br in bug_reports:
+        # Get user info
+        user_email = None
+        user_name = None
+        if br.user:
+            user_email = br.user.email
+            user_name = br.user.full_name
+
+        # Get assignee info
+        assignee_name = None
+        if br.assignee:
+            assignee_name = br.assignee.full_name
+
+        # Get admin responder info
+        admin_responded_by_name = None
+        if br.responder:
+            admin_responded_by_name = br.responder.full_name
+
+        items.append(
+            BugReportResponse(
+                id=br.id,
+                title=br.title,
+                description=br.description,
+                bug_type=br.bug_type,
+                severity=br.severity,
+                steps_to_reproduce=br.steps_to_reproduce,
+                expected_behavior=br.expected_behavior,
+                actual_behavior=br.actual_behavior,
+                device_info=br.device_info,
+                app_version=br.app_version,
+                status=br.status,
+                user_id=br.user_id,
+                user_email=user_email,
+                user_name=user_name,
+                assigned_to=br.assigned_to,
+                assignee_name=assignee_name,
+                resolution_notes=br.resolution_notes,
+                admin_responded_at=br.admin_responded_at,
+                admin_responded_by=br.admin_responded_by,
+                admin_responded_by_name=admin_responded_by_name,
+                created_at=br.created_at,
+                updated_at=br.updated_at,
+            )
+        )
+
+    return BugReportListResponse(
+        items=items,
+        total=total,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+    )
+
+
+@router.get("/bug-reports/{bug_id}", response_model=BugReportResponse)
+async def get_bug_detail(
+    bug_id: int,
+    current_user: AdminUser,
+    db: DBSession,
+):
+    """
+    Get bug report details.
+
+    Requires admin privileges.
+    """
+    from app.db.models import BugReport
+
+    result = await db.execute(
+        select(BugReport)
+        .options(
+            selectinload(BugReport.user),
+            selectinload(BugReport.assignee),
+            selectinload(BugReport.responder),
+        )
+        .where(BugReport.id == bug_id)
+    )
+    bug_report = result.scalar_one_or_none()
+
+    if not bug_report:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Bug report not found"
+        )
+
+    # Get user info
+    user_email = None
+    user_name = None
+    if bug_report.user:
+        user_email = bug_report.user.email
+        user_name = bug_report.user.full_name
+
+    # Get assignee info
+    assignee_name = None
+    if bug_report.assignee:
+        assignee_name = bug_report.assignee.full_name
+
+    # Get admin responder info
+    admin_responded_by_name = None
+    if bug_report.responder:
+        admin_responded_by_name = bug_report.responder.full_name
+
+    return BugReportResponse(
+        id=bug_report.id,
+        title=bug_report.title,
+        description=bug_report.description,
+        bug_type=bug_report.bug_type,
+        severity=bug_report.severity,
+        steps_to_reproduce=bug_report.steps_to_reproduce,
+        expected_behavior=bug_report.expected_behavior,
+        actual_behavior=bug_report.actual_behavior,
+        device_info=bug_report.device_info,
+        app_version=bug_report.app_version,
+        status=bug_report.status,
+        user_id=bug_report.user_id,
+        user_email=user_email,
+        user_name=user_name,
+        assigned_to=bug_report.assigned_to,
+        assignee_name=assignee_name,
+        resolution_notes=bug_report.resolution_notes,
+        admin_responded_at=bug_report.admin_responded_at,
+        admin_responded_by=bug_report.admin_responded_by,
+        admin_responded_by_name=admin_responded_by_name,
+        created_at=bug_report.created_at,
+        updated_at=bug_report.updated_at,
+    )
+
+
+@router.patch("/bug-reports/{bug_id}/status", response_model=BugReportResponse)
+async def update_bug_status(
+    bug_id: int,
+    update: BugReportUpdate,
+    current_user: AdminUser,
+    db: DBSession,
+):
+    """
+    Update bug status and optionally add resolution notes or assign to admin.
+
+    - **status**: New status (open, in_progress, resolved, closed)
+    - **resolution_notes**: Optional resolution notes
+    - **assigned_to**: Optional admin user ID to assign to
+
+    Requires admin privileges.
+    """
+    from app.db.models import BugReport
+
+    result = await db.execute(
+        select(BugReport)
+        .options(
+            selectinload(BugReport.user),
+            selectinload(BugReport.assignee),
+            selectinload(BugReport.responder),
+        )
+        .where(BugReport.id == bug_id)
+    )
+    bug_report = result.scalar_one_or_none()
+
+    if not bug_report:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Bug report not found"
+        )
+
+    # Update status
+    bug_report.status = update.status
+
+    # Update resolution notes if provided
+    if update.resolution_notes:
+        bug_report.resolution_notes = update.resolution_notes
+
+    # Update assignment if provided
+    if update.assigned_to is not None:
+        # Validate that the assigned user exists and is an admin
+        assignee_result = await db.execute(
+            select(User).where(User.id == update.assigned_to)
+        )
+        assignee = assignee_result.scalar_one_or_none()
+        if not assignee:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Assigned user not found"
+            )
+        if assignee.role != "admin":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Can only assign to admin users"
+            )
+        bug_report.assigned_to = update.assigned_to
+
+    # Update admin response tracking if status changed to resolved or closed
+    if update.status in ["resolved", "closed"] and not bug_report.admin_responded_at:
+        bug_report.admin_responded_at = datetime.now(pytz.UTC)
+        bug_report.admin_responded_by = current_user.id
+
+    await db.commit()
+    await db.refresh(bug_report)
+
+    # Get user info
+    user_email = None
+    user_name = None
+    if bug_report.user:
+        user_email = bug_report.user.email
+        user_name = bug_report.user.full_name
+
+    # Get assignee info
+    assignee_name = None
+    if bug_report.assignee:
+        assignee_name = bug_report.assignee.full_name
+
+    # Get admin responder info
+    admin_responded_by_name = None
+    if bug_report.responder:
+        admin_responded_by_name = bug_report.responder.full_name
+
+    return BugReportResponse(
+        id=bug_report.id,
+        title=bug_report.title,
+        description=bug_report.description,
+        bug_type=bug_report.bug_type,
+        severity=bug_report.severity,
+        steps_to_reproduce=bug_report.steps_to_reproduce,
+        expected_behavior=bug_report.expected_behavior,
+        actual_behavior=bug_report.actual_behavior,
+        device_info=bug_report.device_info,
+        app_version=bug_report.app_version,
+        status=bug_report.status,
+        user_id=bug_report.user_id,
+        user_email=user_email,
+        user_name=user_name,
+        assigned_to=bug_report.assigned_to,
+        assignee_name=assignee_name,
+        resolution_notes=bug_report.resolution_notes,
+        admin_responded_at=bug_report.admin_responded_at,
+        admin_responded_by=bug_report.admin_responded_by,
+        admin_responded_by_name=admin_responded_by_name,
+        created_at=bug_report.created_at,
+        updated_at=bug_report.updated_at,
+    )
+
+
+@router.get("/bug-reports/stats", response_model=BugStats)
+async def get_bug_stats(
+    current_user: AdminUser,
+    db: DBSession,
+):
+    """
+    Get bug statistics for dashboard overview.
+
+    Requires admin privileges.
+    """
+    from app.db.models import BugReport
+
+    # Total bugs
+    total_result = await db.execute(select(func.count(BugReport.id)))
+    total_bugs = total_result.scalar() or 0
+
+    # By status
+    open_result = await db.execute(
+        select(func.count(BugReport.id)).where(BugReport.status == "open")
+    )
+    open_bugs = open_result.scalar() or 0
+
+    in_progress_result = await db.execute(
+        select(func.count(BugReport.id)).where(BugReport.status == "in_progress")
+    )
+    in_progress_bugs = in_progress_result.scalar() or 0
+
+    resolved_result = await db.execute(
+        select(func.count(BugReport.id)).where(BugReport.status == "resolved")
+    )
+    resolved_bugs = resolved_result.scalar() or 0
+
+    closed_result = await db.execute(
+        select(func.count(BugReport.id)).where(BugReport.status == "closed")
+    )
+    closed_bugs = closed_result.scalar() or 0
+
+    # By severity
+    critical_result = await db.execute(
+        select(func.count(BugReport.id)).where(BugReport.severity == "critical")
+    )
+    critical_bugs = critical_result.scalar() or 0
+
+    high_result = await db.execute(
+        select(func.count(BugReport.id)).where(BugReport.severity == "high")
+    )
+    high_bugs = high_result.scalar() or 0
+
+    medium_result = await db.execute(
+        select(func.count(BugReport.id)).where(BugReport.severity == "medium")
+    )
+    medium_bugs = medium_result.scalar() or 0
+
+    low_result = await db.execute(
+        select(func.count(BugReport.id)).where(BugReport.severity == "low")
+    )
+    low_bugs = low_result.scalar() or 0
+
+    # Build by_severity dict
+    by_severity = {
+        "critical": critical_bugs,
+        "high": high_bugs,
+        "medium": medium_bugs,
+        "low": low_bugs,
+    }
+
+    # By type
+    by_type = {}
+    for bug_type in ["ui", "api", "performance", "accuracy", "other"]:
+        result = await db.execute(
+            select(func.count(BugReport.id)).where(BugReport.bug_type == bug_type)
+        )
+        by_type[bug_type] = result.scalar() or 0
+
+    # By status
+    by_status = {
+        "open": open_bugs,
+        "in_progress": in_progress_bugs,
+        "resolved": resolved_bugs,
+        "closed": closed_bugs,
+    }
+
+    # Recent count (last 7 days)
+    seven_days_ago = datetime.now(pytz.UTC) - timedelta(days=7)
+    recent_result = await db.execute(
+        select(func.count(BugReport.id)).where(BugReport.created_at >= seven_days_ago)
+    )
+    recent_count = recent_result.scalar() or 0
+
+    return BugStats(
+        total_bugs=total_bugs,
+        open_bugs=open_bugs,
+        in_progress_bugs=in_progress_bugs,
+        resolved_bugs=resolved_bugs,
+        closed_bugs=closed_bugs,
+        critical_bugs=critical_bugs,
+        high_bugs=high_bugs,
+        medium_bugs=medium_bugs,
+        low_bugs=low_bugs,
+        by_severity=by_severity,
+        by_type=by_type,
+        by_status=by_status,
+        recent_count=recent_count,
+    )

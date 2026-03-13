@@ -160,3 +160,48 @@ class PasswordReset(Base):
 
     # Relationships
     user: Mapped["User"] = relationship("User", backref="password_resets")
+
+
+class BugReport(Base):
+    """Model for user-submitted bug reports."""
+
+    __tablename__ = "bug_reports"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("users.id"))
+    session_id: Mapped[Optional[str]] = mapped_column(String(100))
+
+    # Bug details
+    title: Mapped[str] = mapped_column(String(255))
+    description: Mapped[str] = mapped_column(Text)
+    bug_type: Mapped[str] = mapped_column(String(50))  # ui, api, performance, accuracy, other
+    severity: Mapped[str] = mapped_column(String(20))  # low, medium, high, critical
+
+    # Additional context
+    steps_to_reproduce: Mapped[Optional[str]] = mapped_column(Text)
+    expected_behavior: Mapped[Optional[str]] = mapped_column(Text)
+    actual_behavior: Mapped[Optional[str]] = mapped_column(Text)
+
+    # Device info (auto-captured)
+    device_info: Mapped[Optional[str]] = mapped_column(String(255))
+    app_version: Mapped[Optional[str]] = mapped_column(String(50))
+
+    # Admin management
+    status: Mapped[str] = mapped_column(String(20), default="open")  # open, in_progress, resolved, closed
+    assigned_to: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("users.id"))
+    resolution_notes: Mapped[Optional[str]] = mapped_column(Text)
+    admin_responded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    admin_responded_by: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("users.id"))
+
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    # Relationships
+    user: Mapped["User"] = relationship("User", foreign_keys=[user_id])
+    assignee: Mapped["User"] = relationship("User", foreign_keys=[assigned_to])
+    responder: Mapped["User"] = relationship("User", foreign_keys=[admin_responded_by])

@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from app.api.v1 import admin, auth, chat, users
+from app.api.v1 import admin, auth, bug_reports, chat, users
 from app.config import settings
 from app.db.session import close_db, init_db
 from app.utils.logger import log_request, logger
@@ -258,6 +258,8 @@ app.include_router(chat.router, prefix=settings.api_v1_prefix, tags=["Chat"])
 app.include_router(users.router, prefix=settings.api_v1_prefix, tags=["Users"])
 
 app.include_router(admin.router, prefix=settings.api_v1_prefix, tags=["Admin"])
+
+app.include_router(bug_reports.router, prefix=settings.api_v1_prefix, tags=["Bug Reports"])
 
 
 # Root endpoints
