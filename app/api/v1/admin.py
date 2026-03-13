@@ -3,19 +3,25 @@ Admin API endpoints.
 Handles document management and system administration.
 """
 
+import csv
 import logging
 import re
 import time
+from datetime import datetime, timedelta
+from io import StringIO
 from pathlib import Path
-from typing import List, Set
+from typing import List, Optional, Set
+
+import pytz
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, status
+from fastapi.responses import StreamingResponse
+from sqlalchemy import and_, func, select, or_
+from sqlalchemy.sql import text
 
 logger = logging.getLogger("mmara")
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
-from sqlalchemy import func, select
-
 from app.config import settings
-from app.db.models import Document
+from app.db.models import Analytics, ChatSession, Document
 from app.dependencies import AdminUser, DBSession, EmbeddingSvc, RetrievalSvc
 from app.models.document import (
     DocumentInfo,
@@ -23,6 +29,15 @@ from app.models.document import (
     ReindexRequest,
     RetrievalRequest,
     RetrievalResult,
+)
+from app.models.feedback import (
+    AdminResponseRequest,
+    FeedbackDetailResponse,
+    FeedbackExportParams,
+    FeedbackItem,
+    FeedbackListResponse,
+    FeedbackStats,
+    FlagFeedbackRequest,
 )
 from app.services.chunker import LegalDocumentChunker
 
@@ -475,3 +490,561 @@ async def process_pending_documents(
         "total": len(documents),
         "errors": errors,
     }
+
+
+# ==================== Feedback Management ====================
+
+@router.get("/feedback", response_model=FeedbackListResponse)
+async def list_feedback(
+    current_user: AdminUser,
+    db: DBSession,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    category: Optional[str] = Query(None),
+    min_rating: Optional[int] = Query(None, ge=1, le=5),
+    max_rating: Optional[int] = Query(None, ge=1, le=5),
+    flagged_only: bool = Query(False),
+):
+    """
+    List feedback with pagination and filters.
+
+    - **page**: Page number (1-indexed)
+    - **page_size**: Number of items per page (max 100)
+    - **category**: Filter by legal category
+    - **min_rating**: Minimum satisfaction rating (1-5)
+    - **max_rating**: Maximum satisfaction rating (1-5)
+    - **flagged_only**: Only show flagged feedback
+
+    Requires admin privileges.
+    """
+    # Build base query - only return analytics entries that have feedback
+    base_query = select(Analytics).where(
+        or_(
+            Analytics.satisfaction.isnot(None),
+            Analytics.feedback.isnot(None),
+        )
+    )
+
+    # Apply filters
+    if category:
+        base_query = base_query.where(Analytics.category == category)
+
+    if min_rating is not None:
+        base_query = base_query.where(Analytics.satisfaction >= min_rating)
+
+    if max_rating is not None:
+        base_query = base_query.where(Analytics.satisfaction <= max_rating)
+
+    if flagged_only:
+        base_query = base_query.where(Analytics.flagged == True)
+
+    # Get total count
+    count_query = select(func.count()).select_from(base_query.subquery())
+    total_result = await db.execute(count_query)
+    total = total_result.scalar() or 0
+
+    # Calculate pagination
+    total_pages = (total + page_size - 1) // page_size
+    offset = (page - 1) * page_size
+
+    # Execute paginated query with eager loading of user relationships
+    query = base_query.order_by(Analytics.created_at.desc()).offset(offset).limit(page_size)
+    result = await db.execute(query)
+    feedback_items = result.scalars().all()
+
+    # Build response items
+    items = []
+    for item in feedback_items:
+        # Get user info
+        user_name = None
+        user_email = "Unknown"
+        if item.user:
+            user_name = item.user.full_name
+            user_email = item.user.email
+
+        # Get admin responder name
+        admin_name = None
+        if item.responded_by_admin:
+            admin_name = item.responded_by_admin.full_name
+
+        # Try to get message/response content from session
+        message_content = None
+        response_content = None
+        if item.session_id:
+            session_result = await db.execute(
+                select(ChatSession).where(ChatSession.session_id == item.session_id)
+            )
+            session = session_result.scalar_one_or_none()
+            if session and session.messages:
+                for msg in session.messages:
+                    if msg.get("role") == "user" and message_content is None:
+                        message_content = msg.get("content", "")
+                    if msg.get("role") == "assistant" and response_content is None:
+                        response_content = msg.get("content", "")
+
+        items.append(
+            FeedbackItem(
+                id=item.id,
+                user_id=item.user_id or 0,
+                user_email=user_email,
+                user_name=user_name,
+                session_id=item.session_id,
+                message_id=item.message_id,
+                query_type=item.query_type,
+                category=item.category,
+                satisfaction=item.satisfaction,
+                feedback=item.feedback,
+                message_content=message_content,
+                response_content=response_content,
+                flagged=item.flagged,
+                flagged_reason=item.flagged_reason,
+                admin_response=item.admin_response,
+                admin_responded_at=item.admin_responded_at,
+                admin_responded_by=item.admin_responded_by,
+                admin_responded_by_name=admin_name,
+                created_at=item.created_at,
+            )
+        )
+
+    return FeedbackListResponse(
+        items=items,
+        total=total,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+    )
+
+
+@router.get("/feedback/{feedback_id}", response_model=FeedbackDetailResponse)
+async def get_feedback_detail(
+    feedback_id: int,
+    current_user: AdminUser,
+    db: DBSession,
+):
+    """
+    Get full feedback detail with conversation context.
+
+    Requires admin privileges.
+    """
+    result = await db.execute(
+        select(Analytics).where(Analytics.id == feedback_id)
+    )
+    item = result.scalar_one_or_none()
+
+    if not item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Feedback not found"
+        )
+
+    # Get user info
+    user_name = None
+    user_email = "Unknown"
+    if item.user:
+        user_name = item.user.full_name
+        user_email = item.user.email
+
+    # Get admin responder name
+    admin_name = None
+    if item.responded_by_admin:
+        admin_name = item.responded_by_admin.full_name
+
+    # Get full conversation history
+    conversation_history = None
+    message_content = None
+    response_content = None
+    if item.session_id:
+        session_result = await db.execute(
+            select(ChatSession).where(ChatSession.session_id == item.session_id)
+        )
+        session = session_result.scalar_one_or_none()
+        if session:
+            conversation_history = session.messages
+            if session.messages:
+                for msg in session.messages:
+                    if msg.get("role") == "user" and message_content is None:
+                        message_content = msg.get("content", "")
+                    if msg.get("role") == "assistant" and response_content is None:
+                        response_content = msg.get("content", "")
+
+    return FeedbackDetailResponse(
+        id=item.id,
+        user_id=item.user_id or 0,
+        user_email=user_email,
+        user_name=user_name,
+        session_id=item.session_id,
+        message_id=item.message_id,
+        query_type=item.query_type,
+        category=item.category,
+        urgency=item.urgency,
+        satisfaction=item.satisfaction,
+        feedback=item.feedback,
+        message_content=message_content,
+        response_content=response_content,
+        conversation_history=conversation_history,
+        response_time_ms=item.response_time_ms,
+        retrieval_count=item.retrieval_count,
+        is_emergency=item.is_emergency,
+        flagged=item.flagged,
+        flagged_reason=item.flagged_reason,
+        admin_response=item.admin_response,
+        admin_responded_at=item.admin_responded_at,
+        admin_responded_by=item.admin_responded_by,
+        admin_responded_by_name=admin_name,
+        created_at=item.created_at,
+    )
+
+
+@router.post("/feedback/{feedback_id}/flag", response_model=FeedbackItem)
+async def flag_feedback(
+    feedback_id: int,
+    request: FlagFeedbackRequest,
+    current_user: AdminUser,
+    db: DBSession,
+):
+    """
+    Flag or unflag feedback for review.
+
+    - **flagged**: Whether to flag the feedback
+    - **reason**: Optional reason for flagging
+
+    Requires admin privileges.
+    """
+    result = await db.execute(
+        select(Analytics).where(Analytics.id == feedback_id)
+    )
+    item = result.scalar_one_or_none()
+
+    if not item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Feedback not found"
+        )
+
+    item.flagged = request.flagged
+    item.flagged_reason = request.reason if request.flagged else None
+    await db.commit()
+    await db.refresh(item)
+
+    # Get user info
+    user_name = None
+    user_email = "Unknown"
+    if item.user:
+        user_name = item.user.full_name
+        user_email = item.user.email
+
+    # Get admin responder name
+    admin_name = None
+    if item.responded_by_admin:
+        admin_name = item.responded_by_admin.full_name
+
+    # Try to get message/response content from session
+    message_content = None
+    response_content = None
+    if item.session_id:
+        session_result = await db.execute(
+            select(ChatSession).where(ChatSession.session_id == item.session_id)
+        )
+        session = session_result.scalar_one_or_none()
+        if session and session.messages:
+            for msg in session.messages:
+                if msg.get("role") == "user" and message_content is None:
+                    message_content = msg.get("content", "")
+                if msg.get("role") == "assistant" and response_content is None:
+                    response_content = msg.get("content", "")
+
+    return FeedbackItem(
+        id=item.id,
+        user_id=item.user_id or 0,
+        user_email=user_email,
+        user_name=user_name,
+        session_id=item.session_id,
+        message_id=item.message_id,
+        query_type=item.query_type,
+        category=item.category,
+        satisfaction=item.satisfaction,
+        feedback=item.feedback,
+        message_content=message_content,
+        response_content=response_content,
+        flagged=item.flagged,
+        flagged_reason=item.flagged_reason,
+        admin_response=item.admin_response,
+        admin_responded_at=item.admin_responded_at,
+        admin_responded_by=item.admin_responded_by,
+        admin_responded_by_name=admin_name,
+        created_at=item.created_at,
+    )
+
+
+@router.post("/feedback/{feedback_id}/respond")
+async def respond_to_feedback(
+    feedback_id: int,
+    request: AdminResponseRequest,
+    current_user: AdminUser,
+    db: DBSession,
+):
+    """
+    Send admin response to user feedback.
+
+    - **message**: Admin response message
+
+    Requires admin privileges.
+    """
+    result = await db.execute(
+        select(Analytics).where(Analytics.id == feedback_id)
+    )
+    item = result.scalar_one_or_none()
+
+    if not item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Feedback not found"
+        )
+
+    # Store the admin response
+    item.admin_response = request.message
+    item.admin_responded_at = datetime.now(pytz.UTC)
+    item.admin_responded_by = current_user.id
+    await db.commit()
+
+    # TODO: Send notification to user (email, in-app, etc.)
+
+    return {"message": "Response recorded successfully"}
+
+
+@router.get("/feedback/stats")
+async def get_feedback_stats(
+    current_user: AdminUser,
+    db: DBSession,
+):
+    """
+    Get feedback statistics for dashboard overview.
+
+    Requires admin privileges.
+    """
+    # Total feedback count
+    total_result = await db.execute(
+        select(func.count(Analytics.id)).where(
+            or_(
+                Analytics.satisfaction.isnot(None),
+                Analytics.feedback.isnot(None),
+            )
+        )
+    )
+    total_feedback = total_result.scalar() or 0
+
+    # Average rating
+    avg_result = await db.execute(
+        select(func.avg(Analytics.satisfaction)).where(
+            Analytics.satisfaction.isnot(None)
+        )
+    )
+    average_rating = avg_result.scalar()
+
+    # Rating distribution
+    rating_distribution = {}
+    for rating in range(1, 6):
+        result = await db.execute(
+            select(func.count(Analytics.id)).where(
+                Analytics.satisfaction == rating
+            )
+        )
+        rating_distribution[rating] = result.scalar() or 0
+
+    # Flagged count
+    flagged_result = await db.execute(
+        select(func.count(Analytics.id)).where(Analytics.flagged == True)
+    )
+    flagged_count = flagged_result.scalar() or 0
+
+    # By category
+    by_category = {}
+    for category in ["criminal", "road_traffic", "general"]:
+        result = await db.execute(
+            select(func.count(Analytics.id)).where(
+                and_(
+                    Analytics.category == category,
+                    or_(
+                        Analytics.satisfaction.isnot(None),
+                        Analytics.feedback.isnot(None),
+                    )
+                )
+            )
+        )
+        by_category[category] = result.scalar() or 0
+
+    # Recent count (last 7 days)
+    seven_days_ago = datetime.now(pytz.UTC) - timedelta(days=7)
+    recent_result = await db.execute(
+        select(func.count(Analytics.id)).where(
+            and_(
+                Analytics.created_at >= seven_days_ago,
+                or_(
+                    Analytics.satisfaction.isnot(None),
+                    Analytics.feedback.isnot(None),
+                )
+            )
+        )
+    )
+    recent_count = recent_result.scalar() or 0
+
+    return FeedbackStats(
+        total_feedback=total_feedback,
+        average_rating=round(average_rating, 2) if average_rating else None,
+        rating_distribution=rating_distribution,
+        flagged_count=flagged_count,
+        by_category=by_category,
+        recent_count=recent_count,
+    )
+
+
+@router.get("/feedback/export")
+async def export_feedback(
+    current_user: AdminUser,
+    db: DBSession,
+    format: str = Query("csv", regex="^(csv|json)$"),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+    category: Optional[str] = Query(None),
+    min_rating: Optional[int] = Query(None, ge=1, le=5),
+    max_rating: Optional[int] = Query(None, ge=1, le=5),
+    flagged_only: bool = Query(False),
+):
+    """
+    Export feedback as CSV or JSON.
+
+    - **format**: Export format (csv or json)
+    - **date_from**: ISO date string (YYYY-MM-DD)
+    - **date_to**: ISO date string (YYYY-MM-DD)
+    - **category**: Filter by category
+    - **min_rating**: Minimum rating (1-5)
+    - **max_rating**: Maximum rating (1-5)
+    - **flagged_only**: Only export flagged feedback
+
+    Requires admin privileges.
+    """
+    # Build base query
+    base_query = select(Analytics).where(
+        or_(
+            Analytics.satisfaction.isnot(None),
+            Analytics.feedback.isnot(None),
+        )
+    )
+
+    # Apply date filters
+    if date_from:
+        try:
+            from_date = datetime.fromisoformat(date_from)
+            base_query = base_query.where(Analytics.created_at >= from_date)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid date_from format. Use YYYY-MM-DD"
+            )
+
+    if date_to:
+        try:
+            to_date = datetime.fromisoformat(date_to)
+            # Include end of day
+            to_date = to_date.replace(hour=23, minute=59, second=59)
+            base_query = base_query.where(Analytics.created_at <= to_date)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid date_to format. Use YYYY-MM-DD"
+            )
+
+    if category:
+        base_query = base_query.where(Analytics.category == category)
+
+    if min_rating is not None:
+        base_query = base_query.where(Analytics.satisfaction >= min_rating)
+
+    if max_rating is not None:
+        base_query = base_query.where(Analytics.satisfaction <= max_rating)
+
+    if flagged_only:
+        base_query = base_query.where(Analytics.flagged == True)
+
+    # Execute query
+    query = base_query.order_by(Analytics.created_at.desc())
+    result = await db.execute(query)
+    feedback_items = result.scalars().all()
+
+    # Build export data
+    export_data = []
+    for item in feedback_items:
+        user_name = None
+        user_email = "Unknown"
+        if item.user:
+            user_name = item.user.full_name
+            user_email = item.user.email
+
+        admin_name = None
+        if item.responded_by_admin:
+            admin_name = item.responded_by_admin.full_name
+
+        # Get message content from session
+        message_content = None
+        response_content = None
+        if item.session_id:
+            session_result = await db.execute(
+                select(ChatSession).where(ChatSession.session_id == item.session_id)
+            )
+            session = session_result.scalar_one_or_none()
+            if session and session.messages:
+                for msg in session.messages:
+                    if msg.get("role") == "user" and message_content is None:
+                        message_content = msg.get("content", "")
+                    if msg.get("role") == "assistant" and response_content is None:
+                        response_content = msg.get("content", "")
+
+        export_data.append({
+            "id": item.id,
+            "user_email": user_email,
+            "user_name": user_name,
+            "session_id": item.session_id,
+            "message_id": item.message_id,
+            "query_type": item.query_type,
+            "category": item.category,
+            "satisfaction": item.satisfaction,
+            "feedback": item.feedback or "",
+            "message_content": message_content or "",
+            "response_content": response_content or "",
+            "flagged": item.flagged,
+            "flagged_reason": item.flagged_reason or "",
+            "admin_response": item.admin_response or "",
+            "admin_responded_at": item.admin_responded_at.isoformat() if item.admin_responded_at else "",
+            "admin_responded_by_name": admin_name or "",
+            "created_at": item.created_at.isoformat(),
+        })
+
+    if format == "json":
+        import json
+
+        json_data = json.dumps(export_data, indent=2)
+        return StreamingResponse(
+            iter([json_data]),
+            media_type="application/json",
+            headers={
+                "Content-Disposition": f"attachment; filename=feedback_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            }
+        )
+    else:  # CSV
+        output = StringIO()
+        if export_data:
+            csv_writer = csv.writer(output)
+            # Header row
+            csv_writer.writerow(export_data[0].keys())
+            # Data rows
+            for row in export_data:
+                csv_writer.writerow(row.values())
+
+        csv_data = output.getvalue()
+        return StreamingResponse(
+            iter([csv_data]),
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": f"attachment; filename=feedback_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            }
+        )

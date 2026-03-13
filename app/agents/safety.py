@@ -140,8 +140,6 @@ class ResponseValidator(BaseAgent):
         """
         response = context.metadata.get("generated_response", "")
 
-        # Check for required elements
-        has_disclaimer = self._has_disclaimer(response)
         is_emergency = context.metadata.get("is_emergency", False)
 
         # For emergencies, ensure practical guidance
@@ -150,25 +148,10 @@ class ResponseValidator(BaseAgent):
             if not has_practical_guidance:
                 context.metadata["needs_emergency_formatting"] = True
 
-        # Ensure disclaimer is present
-        if not has_disclaimer:
-            response = self._add_disclaimer(response)
-            context.metadata["generated_response"] = response
-
         return AgentResult(
             status=AgentStatus.SUCCESS,
-            data={"response_validated": True, "disclaimer_added": not has_disclaimer},
+            data={"response_validated": True},
         )
-
-    def _has_disclaimer(self, response: str) -> bool:
-        """Check if response contains disclaimer."""
-        disclaimer_indicators = [
-            "not a lawyer",
-            "not a qualified lawyer",
-            "does not constitute legal advice",
-            "educational purposes",
-        ]
-        return any(indicator in response.lower() for indicator in disclaimer_indicators)
 
     def _has_practical_guidance(self, response: str) -> bool:
         """Check if response has practical immediate guidance."""
@@ -182,18 +165,6 @@ class ResponseValidator(BaseAgent):
             "remain calm",
         ]
         return any(indicator in response.lower() for indicator in guidance_indicators)
-
-    def _add_disclaimer(self, response: str) -> str:
-        """Add disclaimer to response."""
-        disclaimer = (
-            "\n\n---\n\n"
-            "**Disclaimer:** I am an AI assistant, not a qualified lawyer. "
-            "This information is for educational purposes only and does not "
-            "constitute legal advice. For serious legal matters, please "
-            "consult a qualified lawyer."
-        )
-        return response + disclaimer
-
 
 class EmergencyHandler(BaseAgent):
     """

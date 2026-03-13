@@ -179,7 +179,7 @@ class AgentOrchestrator:
             response = context.metadata.get("generated_response", "")
 
             # Save to conversation history
-            await self._save_to_history(session_id, query, response)
+            await self._save_to_history(session_id, query, response, message_id=message_id)
 
             total_time = time.time() - start_time
             logger.info("=" * 60)
@@ -228,17 +228,30 @@ class AgentOrchestrator:
 
         context.metadata["generated_response"] = response
 
-    async def _save_to_history(self, session_id: str, user_message: str, assistant_message: str):
+    async def _save_to_history(
+        self,
+        session_id: str,
+        user_message: str,
+        assistant_message: str,
+        message_id: str | None = None,
+    ):
         """Save conversation to history."""
+        user_msg_id = f"user_{message_id}" if message_id else str(uuid.uuid4())
         await self.redis_service.add_message_to_session(
             session_id,
-            {"role": "user", "content": user_message, "timestamp": datetime.utcnow().isoformat()},
+            {
+                "role": "user",
+                "content": user_message,
+                "message_id": user_msg_id,
+                "timestamp": datetime.utcnow().isoformat(),
+            },
         )
         await self.redis_service.add_message_to_session(
             session_id,
             {
                 "role": "assistant",
                 "content": assistant_message,
+                "message_id": message_id or str(uuid.uuid4()),
                 "timestamp": datetime.utcnow().isoformat(),
             },
         )
@@ -268,6 +281,8 @@ class AgentOrchestrator:
             "response_time_ms": execution_time * 1000,
             "rejected": rejected,
             "error": error,
+            "intent": context.metadata.get("intent", "general"),
+            "document_count": context.metadata.get("document_count", 0),
         }
 
     def _calculate_confidence(self, context: AgentContext) -> float:

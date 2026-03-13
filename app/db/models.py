@@ -37,7 +37,10 @@ class User(Base):
         "ChatSession", back_populates="user", cascade="all, delete-orphan"
     )
     analytics: Mapped[list["Analytics"]] = relationship(
-        "Analytics", back_populates="user", cascade="all, delete-orphan"
+        "Analytics",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        foreign_keys="[Analytics.user_id]",
     )
 
 
@@ -93,6 +96,7 @@ class Analytics(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("users.id"))
     session_id: Mapped[Optional[str]] = mapped_column(String(100))
+    message_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
     query_type: Mapped[str] = mapped_column(String(50))
     category: Mapped[Optional[str]] = mapped_column(String(50))
     urgency: Mapped[Optional[str]] = mapped_column(String(20))
@@ -106,8 +110,20 @@ class Analytics(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )
 
+    # Admin management fields
+    flagged: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    flagged_reason: Mapped[Optional[str]] = mapped_column(Text)
+    admin_response: Mapped[Optional[str]] = mapped_column(Text)
+    admin_responded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    admin_responded_by: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("users.id"))
+
     # Relationships
-    user: Mapped["User"] = relationship("User", back_populates="analytics")
+    user: Mapped["User"] = relationship(
+        "User", back_populates="analytics", foreign_keys=[user_id]
+    )
+    responded_by_admin: Mapped[Optional["User"]] = relationship(
+        "User", foreign_keys=[admin_responded_by], backref="admin_responses"
+    )
 
 
 class RateLimit(Base):

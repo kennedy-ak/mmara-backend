@@ -3,6 +3,7 @@ Chat API endpoints.
 Handles user queries and conversation management.
 """
 
+import json
 import time
 from datetime import datetime, timezone
 from typing import Annotated, List, Optional
@@ -11,9 +12,10 @@ from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisco
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.rate_limit import check_rate_limit
-from app.db.models import ChatSession
+from app.db.models import Analytics, ChatSession
 from app.db.session import async_session_maker
 from app.dependencies import DBSession, OrchestratorSvc, RedisSvc, get_current_user
 from app.models.chat import ChatFeedback, ChatRequest, ChatResponse
@@ -86,19 +88,59 @@ async def send_message(
     )
     session = existing_session.scalar_one_or_none()
 
+    # Build message pair to persist
+    user_msg = {
+        "role": "user",
+        "content": request.message,
+        "message_id": f"user_{result.get('message_id', '')}",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    assistant_msg = {
+        "role": "assistant",
+        "content": result.get("response", ""),
+        "message_id": result.get("message_id", ""),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "is_emergency": result.get("is_emergency", False),
+        "citations": result.get("citations", []),
+    }
+
     if session:
         # Update existing session
-        session.message_count += 1
+        existing_messages = list(session.messages or [])
+        existing_messages.extend([user_msg, assistant_msg])
+        session.messages = existing_messages
+        flag_modified(session, "messages")
+        session.message_count += 2
         session.updated_at = datetime.now(timezone.utc)
     else:
-        # Create new session
+        # Create new session with title from first message
+        title = request.message[:80].strip()
+        if len(request.message) > 80:
+            title += "..."
         session = ChatSession(
             session_id=session_id,
             user_id=current_user.id,
+            title=title,
             category=result.get("category"),
-            message_count=1,
+            messages=[user_msg, assistant_msg],
+            message_count=2,
         )
         db.add(session)
+
+    # Track analytics
+    analytics = Analytics(
+        user_id=current_user.id,
+        session_id=session_id,
+        message_id=result.get("message_id"),
+        query_type=result.get("intent", "general"),
+        category=result.get("category"),
+        urgency=result.get("urgency"),
+        response_time_ms=result.get("response_time_ms", 0),
+        retrieval_count=result.get("document_count", 0),
+        tokens_used=0,  # Token tracking not currently implemented
+        is_emergency=result.get("is_emergency", False),
+    )
+    db.add(analytics)
 
     await db.commit()
 
@@ -138,10 +180,13 @@ async def get_chat_history(
 
     formatted_sessions = []
     for session in sessions:
-        # Get messages from Redis
+        # Get messages from Redis first, fall back to DB
         messages = await redis.get_session(session.session_id)
         if not messages:
             messages = session.messages or []
+            # Re-populate Redis from DB if we have messages
+            if messages:
+                await redis.save_session(session.session_id, messages)
 
         formatted_sessions.append(
             ChatHistoryResponse(
@@ -181,10 +226,13 @@ async def get_session_history(
     if not session:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
 
-    # Get messages from Redis
+    # Get messages from Redis first, fall back to DB
     messages = await redis.get_session(session_id)
     if not messages:
         messages = session.messages or []
+        # Re-populate Redis from DB if we have messages
+        if messages:
+            await redis.save_session(session_id, messages)
 
     return ChatHistoryResponse(
         session_id=session.session_id,
@@ -268,8 +316,22 @@ async def submit_feedback(
     - **comment**: Optional comment
     - **helpful**: Whether the response was helpful
     """
-    # Could store feedback in analytics table
-    # For now, just acknowledge
+    from app.db.models import Analytics
+
+    # Find the analytics record for this message
+    result = await db.execute(
+        select(Analytics).where(
+            Analytics.message_id == feedback.message_id,
+            Analytics.user_id == current_user.id,
+        )
+    )
+    analytics = result.scalar_one_or_none()
+
+    if analytics:
+        analytics.satisfaction = feedback.rating
+        analytics.feedback = feedback.comment
+        await db.commit()
+
     return {"message": "Feedback received. Thank you for helping us improve!"}
 
 
@@ -322,11 +384,30 @@ async def websocket_chat(
             await websocket.close(code=1008, reason="No message provided")
             return
 
-        # Stream response
+        # Stream response and collect final data for analytics
+        final_data = {}
         async for chunk in orchestrator.stream_query_with_chunks(
             query=message, session_id=session_id, user_id=user.id
         ):
             await websocket.send_json(chunk)
+            # Track final chunk for analytics
+            chunk_obj = json.loads(chunk) if isinstance(chunk, str) else chunk
+            if chunk_obj.get("type") == "complete":
+                final_data = chunk_obj.get("data", {})
+
+        # Save analytics after stream completes
+        if final_data:
+            analytics = Analytics(
+                user_id=user.id,
+                session_id=final_data.get("session_id") or session_id,
+                message_id=final_data.get("message_id"),
+                query_type="general",  # Intent not exposed in stream
+                response_time_ms=final_data.get("response_time_ms", 0),
+                retrieval_count=len(final_data.get("citations", [])),
+                tokens_used=0,
+            )
+            db.add(analytics)
+            await db.commit()
 
     except WebSocketDisconnect:
         pass
