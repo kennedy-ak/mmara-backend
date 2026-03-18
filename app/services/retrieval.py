@@ -4,7 +4,10 @@ Combines semantic search and BM25 for improved retrieval.
 """
 
 import asyncio
+import hashlib
 import logging
+import pickle
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -16,7 +19,11 @@ from app.services.embeddings import EmbeddingService
 logger = logging.getLogger("mmara.retrieval")
 
 # Timeout for BM25 index building (seconds)
-BM25_BUILD_TIMEOUT = 30
+BM25_BUILD_TIMEOUT = 120
+
+# Cache directory for BM25 index
+BM25_CACHE_DIR = Path("/tmp/bm25_cache")
+BM25_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class RetrievalService:
@@ -47,10 +54,39 @@ class RetrievalService:
         self._bm25_building = False
         self._bm25_failed = False
 
+        # Cache key based on index/namespace to detect changes
+        self._cache_key = self._generate_cache_key()
+
+    def _generate_cache_key(self) -> str:
+        """Generate a unique cache key for the current Pinecone index."""
+        # Use index name and namespace as cache key
+        index_name = getattr(self.embedding_service.index, 'name', 'default')
+        namespace = self.embedding_service.namespace or 'default'
+        key = f"{index_name}:{namespace}"
+        return hashlib.md5(key.encode()).hexdigest()[:16]
+
+    def _get_cache_path(self) -> Path:
+        """Get the cache file path for this index."""
+        return BM25_CACHE_DIR / f"bm25_{self._cache_key}.pkl"
+
     async def build_bm25_index(self):
         """Build BM25 index from Pinecone vectors with timeout."""
         if self._bm25_built or self._bm25_building:
             return
+
+        # Try loading from cache first
+        cache_path = self._get_cache_path()
+        if cache_path.exists():
+            try:
+                logger.info(f"Loading BM25 index from cache: {cache_path.name}")
+                await asyncio.get_event_loop().run_in_executor(
+                    None, self._load_from_cache, cache_path
+                )
+                if self._bm25_built:
+                    logger.info(f"BM25 index loaded from cache with {len(self.documents)} documents")
+                    return
+            except Exception as e:
+                logger.warning(f"Failed to load BM25 from cache: {e}. Building from scratch.")
 
         self._bm25_building = True
         logger.info("Building BM25 index from Pinecone...")
@@ -85,6 +121,12 @@ class RetrievalService:
 
             logger.info(f"BM25 index built with {len(all_docs)} documents")
 
+            # Save to cache for next time
+            await asyncio.get_event_loop().run_in_executor(
+                None, self._save_to_cache, cache_path
+            )
+            logger.info(f"BM25 index cached to {cache_path.name}")
+
         except asyncio.TimeoutError:
             logger.warning(
                 f"BM25 index build timed out after {BM25_BUILD_TIMEOUT}s. "
@@ -97,6 +139,34 @@ class RetrievalService:
         finally:
             self._bm25_building = False
 
+    def _save_to_cache(self, cache_path: Path):
+        """Save BM25 index to disk."""
+        cache_data = {
+            "bm25": self.bm25,
+            "documents": self.documents,
+            "doc_ids": self.doc_ids,
+            "metadatas": self.metadatas,
+            "cache_key": self._cache_key,
+        }
+        with open(cache_path, 'wb') as f:
+            pickle.dump(cache_data, f)
+
+    def _load_from_cache(self, cache_path: Path):
+        """Load BM25 index from disk."""
+        with open(cache_path, 'rb') as f:
+            cache_data = pickle.load(f)
+
+        # Verify cache key matches
+        if cache_data.get("cache_key") != self._cache_key:
+            logger.warning("BM25 cache key mismatch - ignoring cached index")
+            return
+
+        self.bm25 = cache_data["bm25"]
+        self.documents = cache_data["documents"]
+        self.doc_ids = cache_data["doc_ids"]
+        self.metadatas = cache_data["metadatas"]
+        self._bm25_built = True
+
     def _fetch_all_documents(self, index, namespace):
         """Synchronous helper to fetch all documents from Pinecone (runs in thread)."""
         all_docs = []
@@ -104,8 +174,9 @@ class RetrievalService:
         all_metadata = []
         batch_size = 100
         id_batch = []
+        total_fetched = 0
 
-        for id_list in index.list(namespace=namespace):
+        for batch_num, id_list in enumerate(index.list(namespace=namespace), 1):
             for vec_id in id_list:
                 id_batch.append(vec_id)
                 if len(id_batch) >= batch_size:
@@ -116,7 +187,11 @@ class RetrievalService:
                         all_ids.append(vid)
                         all_docs.append(text)
                         all_metadata.append(meta)
+                        total_fetched += 1
                     id_batch = []
+                    # Log progress every 500 docs
+                    if total_fetched % 500 == 0:
+                        logger.info(f"BM25 build: fetched {total_fetched} documents...")
 
         if id_batch:
             fetched = index.fetch(ids=id_batch, namespace=namespace)
@@ -127,6 +202,7 @@ class RetrievalService:
                 all_docs.append(text)
                 all_metadata.append(meta)
 
+        logger.info(f"BM25 build: finished fetching {total_fetched} documents")
         return all_ids, all_docs, all_metadata
 
     def invalidate_bm25_index(self):
@@ -136,6 +212,16 @@ class RetrievalService:
         self.documents = []
         self.doc_ids = []
         self.metadatas = []
+        self._bm25_failed = False
+
+        # Also delete cache file
+        cache_path = self._get_cache_path()
+        if cache_path.exists():
+            try:
+                cache_path.unlink()
+                logger.info(f"Deleted BM25 cache: {cache_path.name}")
+            except Exception as e:
+                logger.warning(f"Failed to delete BM25 cache: {e}")
 
     def _tokenize(self, text: str) -> List[str]:
         """Simple tokenizer for BM25."""

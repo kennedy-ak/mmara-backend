@@ -328,6 +328,56 @@ async def reindex_documents(
     }
 
 
+@router.post("/reindex/bm25")
+async def rebuild_bm25_index(
+    current_user: AdminUser,
+    retrieval_service: RetrievalSvc
+):
+    """
+    Rebuild the BM25 keyword search index from Pinecone.
+
+    This invalidates the cached BM25 index and rebuilds it from scratch.
+    Call this after uploading new documents to ensure they're included in keyword search.
+
+    Requires admin privileges.
+    """
+    # Invalidate current cache
+    retrieval_service.invalidate_bm25_index()
+
+    # Rebuild from Pinecone
+    await retrieval_service.build_bm25_index()
+
+    doc_count = len(retrieval_service.documents)
+
+    return {
+        "message": "BM25 index rebuilt successfully",
+        "document_count": doc_count,
+        "cache_status": "built" if retrieval_service._bm25_built else "failed"
+    }
+
+
+@router.get("/reindex/bm25/status")
+async def get_bm25_status(
+    current_user: AdminUser,
+    retrieval_service: RetrievalSvc
+):
+    """
+    Get the current status of the BM25 keyword search index.
+
+    Returns information about whether the index is built, how many documents it contains,
+    and whether it's currently being built.
+
+    Requires admin privileges.
+    """
+    return {
+        "built": retrieval_service._bm25_built,
+        "building": retrieval_service._bm25_building,
+        "failed": retrieval_service._bm25_failed,
+        "document_count": len(retrieval_service.documents) if retrieval_service._bm25_built else 0,
+        "cache_key": retrieval_service._cache_key
+    }
+
+
 @router.post("/retrieve", response_model=List[RetrievalResult])
 async def test_retrieval(
     request: RetrievalRequest,
@@ -488,15 +538,20 @@ async def process_pending_documents(
 
     await db.commit()
 
-    # Invalidate BM25 index so it rebuilds with new documents on next search
+    # Rebuild BM25 index with new documents in background
     if processed > 0:
+        logger.info(f"Rebuilding BM25 index with {processed} new documents...")
         retrieval_service.invalidate_bm25_index()
+        # Build immediately so it's ready for next search
+        await retrieval_service.build_bm25_index()
+        logger.info(f"BM25 index rebuild complete. Total documents: {len(retrieval_service.documents)}")
 
     return {
         "message": f"Processed {processed} of {len(documents)} documents",
         "processed": processed,
         "total": len(documents),
         "errors": errors,
+        "bm25_index_ready": retrieval_service._bm25_built,
     }
 
 
