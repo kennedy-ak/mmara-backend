@@ -32,6 +32,7 @@ from app.models.user import (
     UserLogin,
 )
 from app.services.email_service import email_service
+from app.utils.logger import log_error, logger
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -78,6 +79,10 @@ async def register(
     await db.commit()
     await db.refresh(new_user)
 
+    logger.info(
+        f"user_registered email={new_user.email} user_id={new_user.id} role={new_user.role}",
+        extra={"extra_data": {"user_id": new_user.id, "email": new_user.email, "role": new_user.role}},
+    )
     return new_user
 
 
@@ -104,6 +109,10 @@ async def login(
 
     # Verify user and password
     if not user or not verify_password(form_data.password, user.hashed_password):
+        logger.warning(
+            f"user_login failed: invalid credentials email={form_data.username}",
+            extra={"extra_data": {"email": form_data.username, "reason": "invalid_credentials"}},
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",
@@ -112,11 +121,19 @@ async def login(
 
     # Check if user is active
     if not user.is_active:
+        logger.warning(
+            f"user_login failed: inactive account email={user.email} user_id={user.id}",
+            extra={"extra_data": {"user_id": user.id, "email": user.email, "reason": "inactive"}},
+        )
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Inactive user")
 
     # Create tokens
     tokens = create_tokens(user.id, user.role)
 
+    logger.info(
+        f"user_login success email={user.email} user_id={user.id} role={user.role}",
+        extra={"extra_data": {"user_id": user.id, "email": user.email, "role": user.role}},
+    )
     return tokens
 
 
@@ -143,6 +160,10 @@ async def login_json(
 
     # Verify user and password
     if not user or not verify_password(credentials.password, user.hashed_password):
+        logger.warning(
+            f"user_login failed: invalid credentials email={credentials.email}",
+            extra={"extra_data": {"email": credentials.email, "reason": "invalid_credentials"}},
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",
@@ -151,11 +172,19 @@ async def login_json(
 
     # Check if user is active
     if not user.is_active:
+        logger.warning(
+            f"user_login failed: inactive account email={user.email} user_id={user.id}",
+            extra={"extra_data": {"user_id": user.id, "email": user.email, "reason": "inactive"}},
+        )
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Inactive user")
 
     # Create tokens
     tokens = create_tokens(user.id, user.role)
 
+    logger.info(
+        f"user_login success email={user.email} user_id={user.id} role={user.role}",
+        extra={"extra_data": {"user_id": user.id, "email": user.email, "role": user.role}},
+    )
     return tokens
 
 
@@ -307,6 +336,10 @@ async def request_password_reset(
         user_name=user.full_name,
     )
 
+    logger.info(
+        f"password_reset_requested user_id={user.id} email={user.email}",
+        extra={"extra_data": {"user_id": user.id, "email": user.email}},
+    )
     return PasswordResetResponse(
         message="If an account with this email exists, a password reset link has been sent."
     )
@@ -377,6 +410,10 @@ async def confirm_password_reset(reset_data: PasswordResetConfirm, db: DBSession
         user_name=user.full_name,
     )
 
+    logger.info(
+        f"password_reset_confirmed user_id={user.id} email={user.email}",
+        extra={"extra_data": {"user_id": user.id, "email": user.email}},
+    )
     return PasswordResetResponse(
         message="Password has been reset successfully. You can now login with your new password."
     )

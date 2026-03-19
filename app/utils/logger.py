@@ -122,31 +122,46 @@ class LogContext:
 
 
 def log_request(
-    method: str, path: str, status_code: int, response_time: float, user_id: int = None, **kwargs
+    method: str, path: str, status_code: int, response_time: float, user_id: int = None,
+    request_id: str = None, **kwargs
 ):
-    """Log an API request."""
-    logger.info(
-        "api_request",
+    """Log an API request with full context."""
+    duration_ms = round(response_time * 1000)
+    level = logging.WARNING if status_code >= 400 else logging.INFO
+    msg = f"api_request {method} {path} {status_code} {duration_ms}ms"
+    if user_id:
+        msg += f" user={user_id}"
+    logger.log(
+        level,
+        msg,
         extra={
-            "method": method,
-            "path": path,
-            "status_code": status_code,
-            "response_time_ms": response_time * 1000,
-            "user_id": user_id,
-            **kwargs,
+            "extra_data": {
+                "method": method,
+                "path": path,
+                "status_code": status_code,
+                "duration_ms": duration_ms,
+                "user_id": user_id,
+                "request_id": request_id,
+                **kwargs,
+            }
         },
     )
 
 
 def log_agent_execution(agent_name: str, status: str, execution_time: float, **kwargs):
-    """Log agent execution."""
-    logger.info(
-        "agent_execution",
+    """Log agent execution with timing and outcome."""
+    duration_ms = round(execution_time * 1000)
+    level = logging.ERROR if status == "error" else logging.INFO
+    logger.log(
+        level,
+        f"agent_execution {agent_name} status={status} duration={duration_ms}ms",
         extra={
-            "agent": agent_name,
-            "status": status,
-            "execution_time_ms": execution_time * 1000,
-            **kwargs,
+            "extra_data": {
+                "agent": agent_name,
+                "status": status,
+                "duration_ms": duration_ms,
+                **kwargs,
+            }
         },
     )
 
@@ -154,14 +169,31 @@ def log_agent_execution(agent_name: str, status: str, execution_time: float, **k
 def log_retrieval(
     query: str, results_count: int, category: str = None, execution_time: float = None, **kwargs
 ):
-    """Log retrieval operation."""
+    """Log a retrieval/search operation."""
+    duration_ms = round(execution_time * 1000) if execution_time else None
+    msg = f"retrieval query='{query[:80]}' results={results_count}"
+    if category:
+        msg += f" category={category}"
+    if duration_ms is not None:
+        msg += f" duration={duration_ms}ms"
     logger.info(
-        "retrieval",
+        msg,
         extra={
-            "query": query[:100],  # Truncate long queries
-            "results_count": results_count,
-            "category": category,
-            "execution_time_ms": execution_time * 1000 if execution_time else None,
-            **kwargs,
+            "extra_data": {
+                "query": query[:100],
+                "results_count": results_count,
+                "category": category,
+                "duration_ms": duration_ms,
+                **kwargs,
+            }
         },
+    )
+
+
+def log_error(message: str, exc: Exception = None, **kwargs):
+    """Log an error with full stack trace and context."""
+    logger.error(
+        message,
+        exc_info=exc is not None,
+        extra={"extra_data": kwargs},
     )

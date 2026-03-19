@@ -5,6 +5,7 @@ An AI-powered legal first-aid assistant for Ghanaians.
 """
 
 import asyncio
+import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -21,7 +22,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from app.api.v1 import admin, auth, bug_reports, chat, users
 from app.config import settings
 from app.db.session import close_db, init_db
-from app.utils.logger import log_request, logger
+from app.utils.logger import log_error, log_request, logger
 from app.utils.metrics import metrics
 
 # API metadata
@@ -191,12 +192,14 @@ async def request_id_middleware(request: Request, call_next: Callable):
 
     # Log request
     duration = time.time() - start_time
+    user_id = getattr(request.state, "user_id", None)
     log_request(
         method=request.method,
         path=request.url.path,
         status_code=response.status_code,
         response_time=duration,
         request_id=request_id,
+        user_id=user_id,
     )
 
     # Track metrics
@@ -213,12 +216,27 @@ async def request_id_middleware(request: Request, call_next: Callable):
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     """Handle HTTP exceptions."""
+    request_id = getattr(request.state, "request_id", None)
+    level = logging.WARNING if exc.status_code < 500 else logging.ERROR
+    logger.log(
+        level,
+        f"http_error {request.method} {request.url.path} {exc.status_code}: {exc.detail}",
+        extra={
+            "extra_data": {
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": exc.status_code,
+                "detail": exc.detail,
+                "request_id": request_id,
+            }
+        },
+    )
     return JSONResponse(
         status_code=exc.status_code,
         content={
             "error": exc.detail,
             "status_code": exc.status_code,
-            "request_id": getattr(request.state, "request_id", None),
+            "request_id": request_id,
         },
     )
 
@@ -226,6 +244,18 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """Handle validation errors."""
+    request_id = getattr(request.state, "request_id", None)
+    logger.warning(
+        f"validation_error {request.method} {request.url.path}: {len(exc.errors())} field(s) invalid",
+        extra={
+            "extra_data": {
+                "method": request.method,
+                "path": request.url.path,
+                "errors": exc.errors(),
+                "request_id": request_id,
+            }
+        },
+    )
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
@@ -239,13 +269,19 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
     """Handle unhandled exceptions."""
-    logger.error(f"Unhandled exception: {exc}", exc_info=True)
-
+    request_id = getattr(request.state, "request_id", None)
+    log_error(
+        f"unhandled_exception {request.method} {request.url.path}: {type(exc).__name__}: {exc}",
+        exc=exc,
+        method=request.method,
+        path=request.url.path,
+        request_id=request_id,
+    )
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={
             "error": "Internal server error",
-            "request_id": getattr(request.state, "request_id", None),
+            "request_id": request_id,
         },
     )
 
