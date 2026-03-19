@@ -14,6 +14,7 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - SECRET_KEY=${SECRET_KEY:-change-this-secret-key}
       - GROQ_API_KEY=${GROQ_API_KEY}
+      - cors_origins=["http://localhost:3000","http://localhost:19006","https://mmara.vendlyghana.space","https://mmara.asogro.com"]
     volumes:
       - ./data:/app/data
       - ./../Criminal_proceeding:/app/documents/criminal:ro

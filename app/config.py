@@ -99,6 +99,14 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_format: str = "json"  # or "text"
 
+    # Observo Logging
+    observo_api_key: Optional[str] = Field(None, alias="OBSERVO_API_KEY")
+    observo_project_id: Optional[str] = Field(None, alias="OBSERVO_PROJECT_ID")
+    observo_url: str = Field(
+        default="https://observo-log.vendlyghana.space/api/v1/ingest/",
+        alias="OBSERVO_URL",
+    )
+
     # Email Configuration
     frontend_url: str = Field(default="http://localhost:3000", alias="FRONTEND_URL")
     smtp_host: Optional[str] = Field(None, alias="SMTP_HOST")

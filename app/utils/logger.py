@@ -10,6 +10,13 @@ from pythonjsonlogger import jsonlogger
 
 from app.config import settings
 
+# Observo remote logging (optional — only attached if API key is configured)
+try:
+    from observo_handler import ObservoHandler as _ObservoHandler
+    _OBSERVO_AVAILABLE = True
+except ImportError:
+    _OBSERVO_AVAILABLE = False
+
 
 class JsonFormatter(jsonlogger.JsonFormatter):
     """Custom JSON formatter with additional fields."""
@@ -60,6 +67,19 @@ def setup_logging(name: str = "mmara", level: str = None, log_format: str = None
 
     handler.setFormatter(formatter)
     logger.addHandler(handler)
+
+    # Attach Observo remote handler if configured
+    if _OBSERVO_AVAILABLE and settings.observo_api_key and settings.observo_project_id:
+        try:
+            observo_handler = _ObservoHandler(
+                project_id=settings.observo_project_id,
+                api_key=settings.observo_api_key,
+                observo_url=settings.observo_url,
+            )
+            observo_handler.setLevel(logging.INFO)
+            logger.addHandler(observo_handler)
+        except Exception as exc:
+            logger.warning(f"Observo handler could not be initialised: {exc}")
 
     return logger
 

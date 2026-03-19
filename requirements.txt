@@ -39,8 +39,9 @@ llama-parse
 # Utilities
 numpy
 aiofiles
-# Loggi
+# Logging & Observability
 python-json-logger
+observo-handler
 
 # Test
 pytest
