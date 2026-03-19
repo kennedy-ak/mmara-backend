@@ -678,203 +678,6 @@ async def list_feedback(
     )
 
 
-@router.get("/feedback/{feedback_id}", response_model=FeedbackDetailResponse)
-async def get_feedback_detail(
-    feedback_id: int,
-    current_user: AdminUser,
-    db: DBSession,
-):
-    """
-    Get full feedback detail with conversation context.
-
-    Requires admin privileges.
-    """
-    result = await db.execute(
-        select(Analytics).where(Analytics.id == feedback_id)
-    )
-    item = result.scalar_one_or_none()
-
-    if not item:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Feedback not found"
-        )
-
-    # Get user info
-    user_name = None
-    user_email = "Unknown"
-    if item.user:
-        user_name = item.user.full_name
-        user_email = item.user.email
-
-    # Get admin responder name
-    admin_name = None
-    if item.responded_by_admin:
-        admin_name = item.responded_by_admin.full_name
-
-    # Get full conversation history
-    conversation_history = None
-    message_content = None
-    response_content = None
-    if item.session_id:
-        session_result = await db.execute(
-            select(ChatSession).where(ChatSession.session_id == item.session_id)
-        )
-        session = session_result.scalar_one_or_none()
-        if session:
-            conversation_history = session.messages
-            if session.messages:
-                for msg in session.messages:
-                    if msg.get("role") == "user" and message_content is None:
-                        message_content = msg.get("content", "")
-                    if msg.get("role") == "assistant" and response_content is None:
-                        response_content = msg.get("content", "")
-
-    return FeedbackDetailResponse(
-        id=item.id,
-        user_id=item.user_id or 0,
-        user_email=user_email,
-        user_name=user_name,
-        session_id=item.session_id,
-        message_id=item.message_id,
-        query_type=item.query_type,
-        category=item.category,
-        urgency=item.urgency,
-        satisfaction=item.satisfaction,
-        feedback=item.feedback,
-        message_content=message_content,
-        response_content=response_content,
-        conversation_history=conversation_history,
-        response_time_ms=item.response_time_ms,
-        retrieval_count=item.retrieval_count,
-        is_emergency=item.is_emergency,
-        flagged=item.flagged,
-        flagged_reason=item.flagged_reason,
-        admin_response=item.admin_response,
-        admin_responded_at=item.admin_responded_at,
-        admin_responded_by=item.admin_responded_by,
-        admin_responded_by_name=admin_name,
-        created_at=item.created_at,
-    )
-
-
-@router.post("/feedback/{feedback_id}/flag", response_model=FeedbackItem)
-async def flag_feedback(
-    feedback_id: int,
-    request: FlagFeedbackRequest,
-    current_user: AdminUser,
-    db: DBSession,
-):
-    """
-    Flag or unflag feedback for review.
-
-    - **flagged**: Whether to flag the feedback
-    - **reason**: Optional reason for flagging
-
-    Requires admin privileges.
-    """
-    result = await db.execute(
-        select(Analytics).where(Analytics.id == feedback_id)
-    )
-    item = result.scalar_one_or_none()
-
-    if not item:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Feedback not found"
-        )
-
-    item.flagged = request.flagged
-    item.flagged_reason = request.reason if request.flagged else None
-    await db.commit()
-    await db.refresh(item)
-
-    # Get user info
-    user_name = None
-    user_email = "Unknown"
-    if item.user:
-        user_name = item.user.full_name
-        user_email = item.user.email
-
-    # Get admin responder name
-    admin_name = None
-    if item.responded_by_admin:
-        admin_name = item.responded_by_admin.full_name
-
-    # Try to get message/response content from session
-    message_content = None
-    response_content = None
-    if item.session_id:
-        session_result = await db.execute(
-            select(ChatSession).where(ChatSession.session_id == item.session_id)
-        )
-        session = session_result.scalar_one_or_none()
-        if session and session.messages:
-            for msg in session.messages:
-                if msg.get("role") == "user" and message_content is None:
-                    message_content = msg.get("content", "")
-                if msg.get("role") == "assistant" and response_content is None:
-                    response_content = msg.get("content", "")
-
-    return FeedbackItem(
-        id=item.id,
-        user_id=item.user_id or 0,
-        user_email=user_email,
-        user_name=user_name,
-        session_id=item.session_id,
-        message_id=item.message_id,
-        query_type=item.query_type,
-        category=item.category,
-        satisfaction=item.satisfaction,
-        feedback=item.feedback,
-        message_content=message_content,
-        response_content=response_content,
-        flagged=item.flagged,
-        flagged_reason=item.flagged_reason,
-        admin_response=item.admin_response,
-        admin_responded_at=item.admin_responded_at,
-        admin_responded_by=item.admin_responded_by,
-        admin_responded_by_name=admin_name,
-        created_at=item.created_at,
-    )
-
-
-@router.post("/feedback/{feedback_id}/respond")
-async def respond_to_feedback(
-    feedback_id: int,
-    request: AdminResponseRequest,
-    current_user: AdminUser,
-    db: DBSession,
-):
-    """
-    Send admin response to user feedback.
-
-    - **message**: Admin response message
-
-    Requires admin privileges.
-    """
-    result = await db.execute(
-        select(Analytics).where(Analytics.id == feedback_id)
-    )
-    item = result.scalar_one_or_none()
-
-    if not item:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Feedback not found"
-        )
-
-    # Store the admin response
-    item.admin_response = request.message
-    item.admin_responded_at = datetime.now(pytz.UTC)
-    item.admin_responded_by = current_user.id
-    await db.commit()
-
-    # TODO: Send notification to user (email, in-app, etc.)
-
-    return {"message": "Response recorded successfully"}
-
-
 @router.get("/feedback/stats")
 async def get_feedback_stats(
     current_user: AdminUser,
@@ -1112,6 +915,203 @@ async def export_feedback(
             }
         )
 
+@router.get("/feedback/{feedback_id}", response_model=FeedbackDetailResponse)
+async def get_feedback_detail(
+    feedback_id: int,
+    current_user: AdminUser,
+    db: DBSession,
+):
+    """
+    Get full feedback detail with conversation context.
+
+    Requires admin privileges.
+    """
+    result = await db.execute(
+        select(Analytics).where(Analytics.id == feedback_id)
+    )
+    item = result.scalar_one_or_none()
+
+    if not item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Feedback not found"
+        )
+
+    # Get user info
+    user_name = None
+    user_email = "Unknown"
+    if item.user:
+        user_name = item.user.full_name
+        user_email = item.user.email
+
+    # Get admin responder name
+    admin_name = None
+    if item.responded_by_admin:
+        admin_name = item.responded_by_admin.full_name
+
+    # Get full conversation history
+    conversation_history = None
+    message_content = None
+    response_content = None
+    if item.session_id:
+        session_result = await db.execute(
+            select(ChatSession).where(ChatSession.session_id == item.session_id)
+        )
+        session = session_result.scalar_one_or_none()
+        if session:
+            conversation_history = session.messages
+            if session.messages:
+                for msg in session.messages:
+                    if msg.get("role") == "user" and message_content is None:
+                        message_content = msg.get("content", "")
+                    if msg.get("role") == "assistant" and response_content is None:
+                        response_content = msg.get("content", "")
+
+    return FeedbackDetailResponse(
+        id=item.id,
+        user_id=item.user_id or 0,
+        user_email=user_email,
+        user_name=user_name,
+        session_id=item.session_id,
+        message_id=item.message_id,
+        query_type=item.query_type,
+        category=item.category,
+        urgency=item.urgency,
+        satisfaction=item.satisfaction,
+        feedback=item.feedback,
+        message_content=message_content,
+        response_content=response_content,
+        conversation_history=conversation_history,
+        response_time_ms=item.response_time_ms,
+        retrieval_count=item.retrieval_count,
+        is_emergency=item.is_emergency,
+        flagged=item.flagged,
+        flagged_reason=item.flagged_reason,
+        admin_response=item.admin_response,
+        admin_responded_at=item.admin_responded_at,
+        admin_responded_by=item.admin_responded_by,
+        admin_responded_by_name=admin_name,
+        created_at=item.created_at,
+    )
+
+
+@router.post("/feedback/{feedback_id}/flag", response_model=FeedbackItem)
+async def flag_feedback(
+    feedback_id: int,
+    request: FlagFeedbackRequest,
+    current_user: AdminUser,
+    db: DBSession,
+):
+    """
+    Flag or unflag feedback for review.
+
+    - **flagged**: Whether to flag the feedback
+    - **reason**: Optional reason for flagging
+
+    Requires admin privileges.
+    """
+    result = await db.execute(
+        select(Analytics).where(Analytics.id == feedback_id)
+    )
+    item = result.scalar_one_or_none()
+
+    if not item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Feedback not found"
+        )
+
+    item.flagged = request.flagged
+    item.flagged_reason = request.reason if request.flagged else None
+    await db.commit()
+    await db.refresh(item)
+
+    # Get user info
+    user_name = None
+    user_email = "Unknown"
+    if item.user:
+        user_name = item.user.full_name
+        user_email = item.user.email
+
+    # Get admin responder name
+    admin_name = None
+    if item.responded_by_admin:
+        admin_name = item.responded_by_admin.full_name
+
+    # Try to get message/response content from session
+    message_content = None
+    response_content = None
+    if item.session_id:
+        session_result = await db.execute(
+            select(ChatSession).where(ChatSession.session_id == item.session_id)
+        )
+        session = session_result.scalar_one_or_none()
+        if session and session.messages:
+            for msg in session.messages:
+                if msg.get("role") == "user" and message_content is None:
+                    message_content = msg.get("content", "")
+                if msg.get("role") == "assistant" and response_content is None:
+                    response_content = msg.get("content", "")
+
+    return FeedbackItem(
+        id=item.id,
+        user_id=item.user_id or 0,
+        user_email=user_email,
+        user_name=user_name,
+        session_id=item.session_id,
+        message_id=item.message_id,
+        query_type=item.query_type,
+        category=item.category,
+        satisfaction=item.satisfaction,
+        feedback=item.feedback,
+        message_content=message_content,
+        response_content=response_content,
+        flagged=item.flagged,
+        flagged_reason=item.flagged_reason,
+        admin_response=item.admin_response,
+        admin_responded_at=item.admin_responded_at,
+        admin_responded_by=item.admin_responded_by,
+        admin_responded_by_name=admin_name,
+        created_at=item.created_at,
+    )
+
+
+@router.post("/feedback/{feedback_id}/respond")
+async def respond_to_feedback(
+    feedback_id: int,
+    request: AdminResponseRequest,
+    current_user: AdminUser,
+    db: DBSession,
+):
+    """
+    Send admin response to user feedback.
+
+    - **message**: Admin response message
+
+    Requires admin privileges.
+    """
+    result = await db.execute(
+        select(Analytics).where(Analytics.id == feedback_id)
+    )
+    item = result.scalar_one_or_none()
+
+    if not item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Feedback not found"
+        )
+
+    # Store the admin response
+    item.admin_response = request.message
+    item.admin_responded_at = datetime.now(pytz.UTC)
+    item.admin_responded_by = current_user.id
+    await db.commit()
+
+    # TODO: Send notification to user (email, in-app, etc.)
+
+    return {"message": "Response recorded successfully"}
+
+
 
 # ==================== Bug Report Management ====================
 
@@ -1242,6 +1242,111 @@ async def list_bug_reports(
         total_pages=total_pages,
     )
 
+
+@router.get("/bug-reports/stats", response_model=BugStats)
+async def get_bug_stats(
+    current_user: AdminUser,
+    db: DBSession,
+):
+    """
+    Get bug statistics for dashboard overview.
+
+    Requires admin privileges.
+    """
+    from app.db.models import BugReport
+
+    # Total bugs
+    total_result = await db.execute(select(func.count(BugReport.id)))
+    total_bugs = total_result.scalar() or 0
+
+    # By status
+    open_result = await db.execute(
+        select(func.count(BugReport.id)).where(BugReport.status == "open")
+    )
+    open_bugs = open_result.scalar() or 0
+
+    in_progress_result = await db.execute(
+        select(func.count(BugReport.id)).where(BugReport.status == "in_progress")
+    )
+    in_progress_bugs = in_progress_result.scalar() or 0
+
+    resolved_result = await db.execute(
+        select(func.count(BugReport.id)).where(BugReport.status == "resolved")
+    )
+    resolved_bugs = resolved_result.scalar() or 0
+
+    closed_result = await db.execute(
+        select(func.count(BugReport.id)).where(BugReport.status == "closed")
+    )
+    closed_bugs = closed_result.scalar() or 0
+
+    # By severity
+    critical_result = await db.execute(
+        select(func.count(BugReport.id)).where(BugReport.severity == "critical")
+    )
+    critical_bugs = critical_result.scalar() or 0
+
+    high_result = await db.execute(
+        select(func.count(BugReport.id)).where(BugReport.severity == "high")
+    )
+    high_bugs = high_result.scalar() or 0
+
+    medium_result = await db.execute(
+        select(func.count(BugReport.id)).where(BugReport.severity == "medium")
+    )
+    medium_bugs = medium_result.scalar() or 0
+
+    low_result = await db.execute(
+        select(func.count(BugReport.id)).where(BugReport.severity == "low")
+    )
+    low_bugs = low_result.scalar() or 0
+
+    # Build by_severity dict
+    by_severity = {
+        "critical": critical_bugs,
+        "high": high_bugs,
+        "medium": medium_bugs,
+        "low": low_bugs,
+    }
+
+    # By type
+    by_type = {}
+    for bug_type in ["ui", "api", "performance", "accuracy", "other"]:
+        result = await db.execute(
+            select(func.count(BugReport.id)).where(BugReport.bug_type == bug_type)
+        )
+        by_type[bug_type] = result.scalar() or 0
+
+    # By status
+    by_status = {
+        "open": open_bugs,
+        "in_progress": in_progress_bugs,
+        "resolved": resolved_bugs,
+        "closed": closed_bugs,
+    }
+
+    # Recent count (last 7 days)
+    seven_days_ago = datetime.now(pytz.UTC) - timedelta(days=7)
+    recent_result = await db.execute(
+        select(func.count(BugReport.id)).where(BugReport.created_at >= seven_days_ago)
+    )
+    recent_count = recent_result.scalar() or 0
+
+    return BugStats(
+        total_bugs=total_bugs,
+        open_bugs=open_bugs,
+        in_progress_bugs=in_progress_bugs,
+        resolved_bugs=resolved_bugs,
+        closed_bugs=closed_bugs,
+        critical_bugs=critical_bugs,
+        high_bugs=high_bugs,
+        medium_bugs=medium_bugs,
+        low_bugs=low_bugs,
+        by_severity=by_severity,
+        by_type=by_type,
+        by_status=by_status,
+        recent_count=recent_count,
+    )
 
 @router.get("/bug-reports/{bug_id}", response_model=BugReportResponse)
 async def get_bug_detail(
@@ -1427,108 +1532,3 @@ async def update_bug_status(
         updated_at=bug_report.updated_at,
     )
 
-
-@router.get("/bug-reports/stats", response_model=BugStats)
-async def get_bug_stats(
-    current_user: AdminUser,
-    db: DBSession,
-):
-    """
-    Get bug statistics for dashboard overview.
-
-    Requires admin privileges.
-    """
-    from app.db.models import BugReport
-
-    # Total bugs
-    total_result = await db.execute(select(func.count(BugReport.id)))
-    total_bugs = total_result.scalar() or 0
-
-    # By status
-    open_result = await db.execute(
-        select(func.count(BugReport.id)).where(BugReport.status == "open")
-    )
-    open_bugs = open_result.scalar() or 0
-
-    in_progress_result = await db.execute(
-        select(func.count(BugReport.id)).where(BugReport.status == "in_progress")
-    )
-    in_progress_bugs = in_progress_result.scalar() or 0
-
-    resolved_result = await db.execute(
-        select(func.count(BugReport.id)).where(BugReport.status == "resolved")
-    )
-    resolved_bugs = resolved_result.scalar() or 0
-
-    closed_result = await db.execute(
-        select(func.count(BugReport.id)).where(BugReport.status == "closed")
-    )
-    closed_bugs = closed_result.scalar() or 0
-
-    # By severity
-    critical_result = await db.execute(
-        select(func.count(BugReport.id)).where(BugReport.severity == "critical")
-    )
-    critical_bugs = critical_result.scalar() or 0
-
-    high_result = await db.execute(
-        select(func.count(BugReport.id)).where(BugReport.severity == "high")
-    )
-    high_bugs = high_result.scalar() or 0
-
-    medium_result = await db.execute(
-        select(func.count(BugReport.id)).where(BugReport.severity == "medium")
-    )
-    medium_bugs = medium_result.scalar() or 0
-
-    low_result = await db.execute(
-        select(func.count(BugReport.id)).where(BugReport.severity == "low")
-    )
-    low_bugs = low_result.scalar() or 0
-
-    # Build by_severity dict
-    by_severity = {
-        "critical": critical_bugs,
-        "high": high_bugs,
-        "medium": medium_bugs,
-        "low": low_bugs,
-    }
-
-    # By type
-    by_type = {}
-    for bug_type in ["ui", "api", "performance", "accuracy", "other"]:
-        result = await db.execute(
-            select(func.count(BugReport.id)).where(BugReport.bug_type == bug_type)
-        )
-        by_type[bug_type] = result.scalar() or 0
-
-    # By status
-    by_status = {
-        "open": open_bugs,
-        "in_progress": in_progress_bugs,
-        "resolved": resolved_bugs,
-        "closed": closed_bugs,
-    }
-
-    # Recent count (last 7 days)
-    seven_days_ago = datetime.now(pytz.UTC) - timedelta(days=7)
-    recent_result = await db.execute(
-        select(func.count(BugReport.id)).where(BugReport.created_at >= seven_days_ago)
-    )
-    recent_count = recent_result.scalar() or 0
-
-    return BugStats(
-        total_bugs=total_bugs,
-        open_bugs=open_bugs,
-        in_progress_bugs=in_progress_bugs,
-        resolved_bugs=resolved_bugs,
-        closed_bugs=closed_bugs,
-        critical_bugs=critical_bugs,
-        high_bugs=high_bugs,
-        medium_bugs=medium_bugs,
-        low_bugs=low_bugs,
-        by_severity=by_severity,
-        by_type=by_type,
-        by_status=by_status,
-        recent_count=recent_count,
-    )
